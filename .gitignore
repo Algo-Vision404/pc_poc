@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.env
+
+# Generated training artifacts (large binary files — do not commit)
+train and vis/artifacts/synthetic_data/
+train and vis/artifacts/models/*.pt
+train and vis/artifacts/models/*.onnx
+train and vis/artifacts/videos/
+
+# Node
+ui/node_modules/
+ui/dist/
+
+# OS
+.DS_Store
+Thumbs.db
