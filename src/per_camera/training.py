@@ -2,49 +2,71 @@
 
 Usage::
 
-    python -m per_camera.training --samples 2048 --epochs 30 --batch 32
-    pc-poc-train --samples 2048 --epochs 30 --batch 32
+    python -m per_camera.training --samples 2048 --epochs 30 --batch 32 --seed 0
+    pc-poc-train --samples 2048 --epochs 30 --batch 32 --seed 0
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from .data import PerCameraDataset, build_transform, collate_fn, generate_synthetic_dataset
+from .detection import SIZE_LOSS_WEIGHT, focal_loss, reg_l1_loss
 from .metrics import evaluate
 from .model import ARCH_VERSION, BigPerCameraNet
 from .paths import (
     CHECKPOINT_PATH,
     IMG_SIZE,
-    MODEL_DIR,
     ONNX_PATH,
     RESULTS_JSON,
     ensure_artifact_dirs,
 )
 
-# Relative loss weights. Depth is upweighted because its target is spatially
-# sparse (the object covers ~10-15% of pixels).
-DEPTH_LOSS_WEIGHT = 30.0
-BBOX_LOSS_WEIGHT = 2.0
+# Relative loss weights. Depth is dense now (a full depth field, not a sparse
+# object mask), so it no longer needs the 30x upweighting the previous sparse
+# target required.
+DEPTH_LOSS_WEIGHT = 5.0
+
+
+def seed_everything(seed: int) -> torch.Generator:
+    """Seed every RNG the pipeline touches and return a split generator."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def val_score(metrics: dict[str, float]) -> float:
+    """Single scalar used for model selection and early stopping.
+
+    Higher is better. Combines the two detection/segmentation quality signals
+    and penalises depth error.
+    """
+    return metrics["mIoU"] + metrics["ap50"] - metrics["rmse"]
 
 
 def _configure_stdout() -> None:
     """Force UTF-8 on stdout without replacing the stream object.
 
-    The previous implementation reassigned ``sys.stdout`` to a new
-    ``TextIOWrapper``. That orphaned the original wrapper, whose finaliser
-    closed the shared buffer, so every later ``print`` raised
-    ``ValueError: I/O operation on closed file`` and the run exited 1.
-    ``reconfigure`` mutates the existing stream in place and is safe.
+    An earlier version reassigned ``sys.stdout`` to a new ``TextIOWrapper``.
+    That orphaned the original wrapper, whose finaliser closed the shared
+    buffer, so every later ``print`` raised ``ValueError: I/O operation on
+    closed file`` and the run exited 1. ``reconfigure`` mutates in place.
     """
     reconfigure = getattr(sys.stdout, "reconfigure", None)
     if reconfigure is not None:
@@ -90,7 +112,7 @@ def load_checkpoint(
     if not path.is_file():
         raise FileNotFoundError(
             f"No checkpoint at {path}. Train one first: "
-            f"`python -m per_camera.training --samples 2048 --epochs 30 --batch 32`"
+            "`python -m per_camera.training --samples 2048 --epochs 30 --batch 32 --seed 0`"
         )
 
     checkpoint = torch.load(path, map_location=device, weights_only=True)
@@ -124,7 +146,7 @@ def export_onnx(model: nn.Module, device: torch.device, onnx_path: Path) -> bool
             opset_version=18,
             do_constant_folding=True,
             input_names=["input"],
-            output_names=["seg", "depth", "det"],
+            output_names=["seg", "depth", "heatmap", "offset", "size"],
         )
     except Exception as exc:  # noqa: BLE001 - export is optional, must not kill a run
         print(f"[warn] ONNX export skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
@@ -143,6 +165,8 @@ def train(
     epochs: int = 1,
     batch_size: int = 4,
     max_samples: int | None = 64,
+    seed: int = 0,
+    patience: int = 8,
     device: torch.device | None = None,
 ) -> dict:
     """Train the network and write a checkpoint plus a results JSON."""
@@ -154,6 +178,7 @@ def train(
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
     ensure_artifact_dirs()
+    generator = seed_everything(seed)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = PerCameraDataset(manifest_csv, transform=build_transform(), max_samples=max_samples)
@@ -164,49 +189,65 @@ def train(
 
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_ds, val_ds = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=generator
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     model = BigPerCameraNet().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
     seg_loss_fn = nn.CrossEntropyLoss()
     depth_loss_fn = nn.MSELoss()
-    det_cls_loss_fn = nn.BCEWithLogitsLoss()
-    det_bbox_loss_fn = nn.SmoothL1Loss()
 
-    checkpoint_path = CHECKPOINT_PATH
-    best_loss = float("inf")
-    best_metrics: dict = {}
+    best_path = CHECKPOINT_PATH
+    last_path = CHECKPOINT_PATH.with_name("poc_checkpoint_last.pt")
+    best_score = float("-inf")
+    best_metrics: dict[str, float] = {}
+    best_epoch = 0
+    epochs_without_improvement = 0
+    history: list[dict] = []
 
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
         for batch in train_loader:
+            ann = batch["ann"]
             imgs = batch["image"].to(device)
             seg_t = batch["seg"].to(device)
             depth_t = batch["depth"].to(device)
-            cls_t = batch["ann"]["class"].to(device).float().unsqueeze(1)
-            bbox_t = batch["ann"]["bbox"].to(device)
+
+            heatmap_t = ann["heatmap"].to(device)
+            reg_mask = ann["reg_mask"].to(device)
+            reg_index = ann["reg_index"].to(device)
+            offset_t = ann["offset"].to(device)
+            size_t = ann["size"].to(device)
 
             optimizer.zero_grad()
             out = model(imgs)
 
             seg_logits = nn.functional.interpolate(
-                out["seg"], size=seg_t.shape[-2:], mode="bilinear"
+                out["seg"], size=seg_t.shape[-2:], mode="bilinear", align_corners=False
             )
             depth_pred = nn.functional.interpolate(
-                out["depth"], size=depth_t.shape[-2:], mode="bilinear"
+                out["depth"], size=depth_t.shape[-2:], mode="bilinear", align_corners=False
             )
 
+            seg_loss = seg_loss_fn(seg_logits, seg_t)
+            depth_loss = depth_loss_fn(depth_pred, depth_t)
+            hm_loss = focal_loss(out["heatmap"], heatmap_t)
+            off_loss = reg_l1_loss(out["offset"], reg_mask, reg_index, offset_t)
+            size_loss = reg_l1_loss(out["size"], reg_mask, reg_index, size_t)
+
             loss = (
-                seg_loss_fn(seg_logits, seg_t)
-                + DEPTH_LOSS_WEIGHT * depth_loss_fn(depth_pred, depth_t)
-                + det_cls_loss_fn(out["det"][:, 0:1], cls_t)
-                + BBOX_LOSS_WEIGHT * det_bbox_loss_fn(out["det"][:, 1:5], bbox_t)
+                seg_loss
+                + DEPTH_LOSS_WEIGHT * depth_loss
+                + hm_loss
+                + off_loss
+                + SIZE_LOSS_WEIGHT * size_loss
             )
             loss.backward()
             optimizer.step()
@@ -214,46 +255,84 @@ def train(
 
         scheduler.step()
 
-        val_miou, val_rmse, val_det_iou = evaluate(model, val_loader, device)
+        metrics = evaluate(model, val_loader, device)
         avg_train_loss = epoch_loss / len(train_loader)
+        score = val_score(metrics)
 
+        history.append({"epoch": epoch + 1, "train_loss": avg_train_loss, **metrics})
         print(
             f"Epoch {epoch + 1}/{epochs} - Loss: {avg_train_loss:.4f} "
-            f"- Val mIoU: {val_miou:.4f} - Val RMSE: {val_rmse:.4f} "
-            f"- Val Det IoU: {val_det_iou:.4f}"
+            f"- Val mIoU: {metrics['mIoU']:.4f} - Val AP50: {metrics['ap50']:.4f} "
+            f"- Val RMSE: {metrics['rmse']:.4f} - Val AbsRel: {metrics['abs_rel']:.4f}"
         )
 
-        if avg_train_loss < best_loss:
-            best_loss = avg_train_loss
-            best_metrics = {
-                "val_mIoU": val_miou,
-                "val_rmse": val_rmse,
-                "val_det_iou": val_det_iou,
-                "loss": avg_train_loss,
-            }
+        # Select on validation quality, not on training loss. The previous
+        # version compared training loss against a variable named
+        # `best_val_loss`, so "best" was always simply the last epoch.
+        torch.save(
+            make_checkpoint_payload(
+                model,
+                optimizer,
+                epoch=epoch + 1,
+                loss=avg_train_loss,
+                metrics=metrics,
+                config={
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "max_samples": max_samples,
+                    "seed": seed,
+                    "manifest": str(manifest_csv),
+                    "dataset_size": len(dataset),
+                },
+            ),
+            last_path,
+        )
+
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch + 1
+            best_metrics = dict(metrics)
+            epochs_without_improvement = 0
             torch.save(
                 make_checkpoint_payload(
                     model,
                     optimizer,
                     epoch=epoch + 1,
                     loss=avg_train_loss,
-                    metrics=best_metrics,
+                    metrics=metrics,
                     config={
                         "epochs": epochs,
                         "batch_size": batch_size,
                         "max_samples": max_samples,
+                        "seed": seed,
                         "manifest": str(manifest_csv),
                         "dataset_size": len(dataset),
                     },
                 ),
-                checkpoint_path,
+                best_path,
             )
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(
+                    f"Early stopping at epoch {epoch + 1}: no validation "
+                    f"improvement for {patience} epochs (best was epoch {best_epoch})."
+                )
+                break
 
     results = {
         "arch_version": ARCH_VERSION,
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(best_path),
+        "best_epoch": best_epoch,
         "best_metrics": best_metrics,
-        "config": {"epochs": epochs, "batch_size": batch_size, "dataset_size": len(dataset)},
+        "best_score": best_score,
+        "config": {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "dataset_size": len(dataset),
+            "seed": seed,
+        },
+        "history": history,
         "torch_version": str(torch.__version__),
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -262,7 +341,7 @@ def train(
         json.dump(results, fh, indent=2)
 
     print("Exporting model to ONNX format...")
-    load_checkpoint(checkpoint_path, model=model, device=device)
+    load_checkpoint(best_path, model=model, device=device)
     if export_onnx(model, device, ONNX_PATH):
         results["onnx_path"] = str(ONNX_PATH)
         with open(RESULTS_JSON, "w") as fh:
@@ -279,24 +358,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--max_samples", type=int, default=None, help="cap the dataset size")
+    parser.add_argument("--seed", type=int, default=0, help="makes the whole run reproducible")
+    parser.add_argument("--patience", type=int, default=8, help="early-stopping patience")
     args = parser.parse_args(argv)
 
     if args.samples < 1:
         parser.error("--samples must be >= 1")
+    if args.patience < 1:
+        parser.error("--patience must be >= 1")
 
     _configure_stdout()
     ensure_artifact_dirs()
 
-    manifest = generate_synthetic_dataset(args.samples)
-    print(f"Generated {args.samples} samples -> {manifest}")
-    print(f"Artifacts root: {MODEL_DIR.parent}")
+    manifest = generate_synthetic_dataset(args.samples, seed=args.seed)
+    print(f"Generated {args.samples} samples (seed={args.seed}) -> {manifest}")
 
     results = train(
-        manifest, epochs=args.epochs, batch_size=args.batch, max_samples=args.max_samples
+        manifest,
+        epochs=args.epochs,
+        batch_size=args.batch,
+        max_samples=args.max_samples,
+        seed=args.seed,
+        patience=args.patience,
     )
 
-    print("Training complete. Best metrics:")
-    print(json.dumps(results, indent=2))
+    print(f"Training complete. Best metrics (epoch {results['best_epoch']}):")
+    print(json.dumps(results["best_metrics"], indent=2))
     return 0
 
 

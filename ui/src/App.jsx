@@ -1,6 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
 import './index.css';
 
+// Never hardcode the backend origin: the dashboard is served from a different
+// host in every real deployment. Falls back to the Vite dev proxy.
+const API_URL = import.meta.env.VITE_API_URL ?? '/api';
+
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -56,7 +60,11 @@ function App() {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
       setSelectedFile(file);
-      setPreview(URL.createObjectURL(file));
+      // Release the previous blob URL, otherwise each upload leaks one.
+      setPreview((prev) => {
+        if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(file);
+      });
       setResults(null);
     }
   };
@@ -65,11 +73,11 @@ function App() {
     const formData = new FormData();
     formData.append('file', fileToPredict);
     try {
-      const res = await fetch('http://127.0.0.1:8000/predict', {
+      const res = await fetch(`${API_URL}/predict`, {
         method: 'POST',
         body: formData,
       });
-      if (!res.ok) throw new Error('Prediction failed');
+      if (!res.ok) throw new Error(`Prediction failed: ${res.status}`);
       return await res.json();
     } catch (err) {
       console.error(err);
@@ -154,7 +162,11 @@ function App() {
     return () => stopAllStreams(); // Cleanup on unmount
   }, []);
 
-  const shouldShowDet = results && results.score >= confidenceThreshold;
+  // Boxes the API returned, filtered by the confidence slider. The backend
+  // already normalises them to the ORIGINAL image, so they line up with the
+  // preview regardless of its aspect ratio.
+  const detections = results?.detections ?? [];
+  const visibleDetections = detections.filter((d) => d.score >= confidenceThreshold);
 
   return (
     <div className="app-container">
@@ -216,13 +228,16 @@ function App() {
             <div className="results-panel glass-panel slide-up">
               <h2>Telemetry Results</h2>
               <div className="stats-bar">
-                  <div className="stat"><span>Detection Score</span> <strong>{(results.score * 100).toFixed(1)}%</strong></div>
                   <div className="stat">
-                    <span>BBox [x,y,w,h]</span> 
+                    <span>Detections</span>
+                    <strong>{visibleDetections.length} shown / {detections.length} found</strong>
+                  </div>
+                  <div className="stat">
+                    <span>Top Score</span>
                     <strong>
-                      {shouldShowDet 
-                        ? `[${results.bbox.x.toFixed(2)}, ${results.bbox.y.toFixed(2)}, ${results.bbox.w.toFixed(2)}, ${results.bbox.h.toFixed(2)}]` 
-                        : "Suppressed (Low Confidence)"}
+                      {detections.length > 0
+                        ? `${(Math.max(...detections.map((d) => d.score)) * 100).toFixed(1)}%`
+                        : 'No object detected'}
                     </strong>
                   </div>
               </div>
@@ -232,19 +247,24 @@ function App() {
                   <h3>Input + Detection</h3>
                   <div style={{position: 'relative', width: '100%'}}>
                     <img src={preview || `data:image/png;base64,${results.input_b64}`} alt="Detection" />
-                    {shouldShowDet && (
-                      <div style={{
-                        position: 'absolute',
-                        left: `${(results.bbox.x - results.bbox.w/2) * 100}%`,
-                        top: `${(results.bbox.y - results.bbox.h/2) * 100}%`,
-                        width: `${results.bbox.w * 100}%`,
-                        height: `${results.bbox.h * 100}%`,
-                        border: '2px solid red',
-                        pointerEvents: 'none'
-                      }}>
-                        <span style={{color:'red', fontSize:'10px', position:'absolute', top:'-15px', left:'-2px'}}>Det: {results.score.toFixed(2)}</span>
+                    {visibleDetections.map((det, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          position: 'absolute',
+                          left: `${det.x * 100}%`,
+                          top: `${det.y * 100}%`,
+                          width: `${det.w * 100}%`,
+                          height: `${det.h * 100}%`,
+                          border: '2px solid red',
+                          pointerEvents: 'none'
+                        }}
+                      >
+                        <span style={{color:'red', fontSize:'10px', position:'absolute', top:'-15px', left:'-2px'}}>
+                          {det.score.toFixed(2)}
+                        </span>
                       </div>
-                    )}
+                    ))}
                   </div>
                 </div>
                 <div className="grid-item">

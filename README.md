@@ -18,12 +18,14 @@ A production-grade, multi-task autonomous perception framework built on a ResNet
 
 ## Overview
 
-This project evolved from a lightweight single-task PoC (`TinyPerCameraNet`) into a scalable, production-grade multi-task vision system (`BigPerCameraNet`). Key engineering upgrades include:
+This project evolved from a lightweight single-task PoC (`TinyPerCameraNet`) into a multi-task vision system (`BigPerCameraNet`). Current design:
 
-- **Spatial-preserving detection head** — replaced destructive `AdaptiveAvgPool2d` with spatial convolutions to fix bounding box coordinate collapse
-- **Depth-aware synthetic dataset** — ground-truth depth is deterministically derived from object area (simulating real-world perspective cues), providing a learnable signal
-- **Loss weighting** — depth loss weighted at `30×` relative to segmentation to prevent gradient starvation on sparse targets
-- **Production stack** — FastAPI inference API + React/Vite dashboard with live streaming support
+- **Anchor-free detection head** — a CenterNet-style heatmap plus sub-pixel offset and size regression at stride 4, so the model emits 0..N boxes per frame and a confidence score worth thresholding. (The earlier head flattened the feature map and regressed one box through an FC layer, which structurally capped it at a single detection.)
+- **A real depth field** — the background carries a receding ground plane and each object has its own depth, cued by size *and* aerial-perspective brightness. Previously depth was a constant inside the object and zero outside, which made it the segmentation mask plus one scalar that was a pure function of box area — a shortcut, not a depth signal.
+- **Multi-object scenes with empty frames** — 0–3 objects per frame, ~20% empty, painted far-to-near for occlusion. Empty frames are what give the classification head a negative class to learn.
+- **Honest metrics** — true per-class mIoU (not foreground-only), AP@0.5 with proper precision/recall, and AbsRel for depth.
+- **Reproducible runs** — `--seed` seeds the dataset, the train/val split, and the weight init. Checkpoints are selected on validation quality, with early stopping.
+- **Production stack** — FastAPI inference API + React/Vite dashboard with live streaming support.
 
 ---
 
@@ -52,15 +54,15 @@ This project evolved from a lightweight single-task PoC (`TinyPerCameraNet`) int
                             │
          ┌──────────────────┼──────────────────┐
          │                  │                  │
-┌────────▼───────┐ ┌────────▼───────┐ ┌────────▼───────┐
-│  Segmentation  │ │   Depth Head   │ │ Detection Head │
-│     Head       │ │                │ │                │
-│ Conv3×3 ×2    │ │ Conv3×3 ×2    │ │ Conv3×3 s2 ×2  │
-│ Upsample ×4/×2 │ │ Upsample ×4/×2 │ │ Flatten → FC   │
-│ 2-class logits │ │ Conv1×1+Sigmoid│ │ FC cls + bbox  │
-└────────┬───────┘ └────────┬───────┘ └────────┬───────┘
+┌────────▼───────┐ ┌────────▼───────┐ ┌────────▼────────┐
+│  Segmentation  │ │   Depth Head   │ │ Detection Head  │
+│     Head       │ │                │ │ (anchor-free)   │
+│ Conv3×3 ×2    │ │ Conv3×3 ×2    │ │ Conv3×3, up ×2  │
+│ Upsample ×4/×2 │ │ Upsample ×4/×2 │ │ 3 × Conv1×1     │
+│ 2-class logits │ │ Conv1×1+Sigmoid│ │ heat/off/size   │
+└────────┬───────┘ └────────┬───────┘ └────────┬────────┘
          │                  │                  │
-    Seg Mask (H×W)    Depth Map (H×W)   [cls_score, x, y, w, h]
+    Seg Mask (H×W)    Depth Map (H×W)   N × [x, y, w, h, score]
 ```
 
 ### Residual Block
@@ -72,35 +74,45 @@ Input ──► Conv3×3 ──► BN ──► ReLU ──► Conv3×3 ──�
                           (only if stride≠1 or channel mismatch)
 ```
 
-### Detection Head (Spatial-Preserving)
+### Detection Head (anchor-free, CenterNet-style)
 
 ```
-Feature Map (128ch, 16×16)
+Feature Map (128ch, 16×16, stride 8)
     │
-    ▼  Conv3×3 s2 + BN + ReLU   →  64ch, 8×8
+    ▼  Conv3×3 + BN + ReLU            →  64ch
     │
-    ▼  Conv3×3 s2 + BN + ReLU   →  32ch, 4×4
+    ▼  Upsample ×2                    →  64ch, 32×32 (stride 4)
     │
-    ▼  Flatten  →  512
+    ▼  Conv3×3 + BN + ReLU            →  32ch
     │
-    ▼  FC(512→256) + ReLU + Dropout(0.3)
-    │
-    ├──► FC(256→1)              →  cls score (BCEWithLogits)
-    └──► FC(256→4) + Sigmoid    →  [xc, yc, w, h] normalized (SmoothL1)
+    ├──► Conv1×1  →  heatmap  (C, 32×32)   per-pixel class score
+    ├──► Conv1×1  →  offset   (2, 32×32)   sub-pixel centre residual
+    └──► Conv1×1  →  size     (2, 32×32)   object w, h in feature units
 ```
 
-> No `AdaptiveAvgPool2d` anywhere in the head — pooling destroys the spatial
-> signal the box regression depends on. Strided convolutions keep it.
+Decoding applies a 3×3 max-pool NMS to the heatmap, takes the top-K peaks, and
+lifts each back to image coordinates using its offset and size.
+
+> **Why replace the old head?** The previous version flattened the feature map
+> and regressed a single box through an FC layer. That structurally could not
+> emit more than one detection, and because every frame contained exactly one
+> object with a hardcoded class label of `1`, the classifier was trained on a
+> constant target and its "confidence" carried no information. The heatmap head
+> handles 0..N objects and produces a score worth thresholding.
 
 ### Multi-Task Loss
 
 ```
-L_total = L_seg  +  30 × L_depth  +  L_cls  +  2 × L_bbox
-            │             │              │            │
-       CrossEntropy      MSE       BCEWithLogits  SmoothL1
+L_total = L_seg  +  5 × L_depth  +  L_heatmap  +  L_offset  +  0.1 × L_size
+            │           │              │             │              │
+       CrossEntropy    MSE       focal (CenterNet)  L1@peaks    L1@peaks
 ```
 
-> **Why 30× depth weight?** The depth targets are spatially sparse (object occupies ~10–15% of pixels). Without upweighting, the optimizer ignores depth gradients entirely in favour of the dominant segmentation loss.
+> **Why 5× and not 30×?** The old depth target was sparse — a constant inside
+> the object and zero everywhere else — so it needed heavy upweighting to
+> compete with the segmentation loss. Depth is now a dense field (a receding
+> background plane plus per-object values), so it carries gradient everywhere
+> and needs far less help.
 
 ### End-to-End Stack
 
@@ -140,7 +152,8 @@ pc_poc/
 │   ├── paths.py              # Artifact resolution (repo-anchored, env-overridable)
 │   ├── model.py              # BigPerCameraNet + ARCH_VERSION
 │   ├── data.py               # Dataset generation, Dataset, collate, transform
-│   ├── metrics.py            # IoU / RMSE evaluation
+│   ├── detection.py          # Heatmap targets, focal loss, NMS decoding, AP
+│   ├── metrics.py            # mIoU / RMSE / AbsRel / AP@0.5 evaluation
 │   ├── training.py           # Training loop + checkpoint I/O
 │   ├── api.py                # FastAPI inference server
 │   ├── inference.py          # Offline batch inference -> MP4 grid
@@ -170,29 +183,40 @@ repository — **never** to the current working directory. Override it with
 
 ## Performance
 
-Metrics are written to `artifacts/results/poc_results.json` by every training
-run, and that file — not this README — is the source of truth. Checkpoint
-metadata (epoch, config, metrics, architecture version, torch version) is
-embedded in the `.pt` file itself, so you can always tell which model you have.
+Reference run — `--samples 512 --epochs 20 --batch 32 --seed 0`, CPU, torch 2.14.1:
 
-```json
-{
-  "arch_version": "big-per-camera-net-v1",
-  "best_metrics": { "val_mIoU": 0.0, "val_rmse": 0.0738, "val_det_iou": 0.1265 },
-  "config": { "epochs": 5, "batch_size": 32, "dataset_size": 128 },
-  "torch_version": "2.14.1+cu130"
-}
+| Metric | Value | Notes |
+|---|---|---|
+| **Detection AP@0.5** | **0.988** | precision 1.000, recall 0.988 |
+| **Segmentation mIoU** | **0.952** | true mean over both classes |
+| **Depth RMSE** | **0.040** | on a dense depth field in `[0, 1]` |
+| **Depth AbsRel** | **0.043** | scale-invariant relative error |
+
+Every run writes `artifacts/results/poc_results.json` with the full per-epoch
+history, and that file — not this README — is the source of truth. Checkpoint
+metadata (epoch, config, metrics, architecture version, torch version) is
+embedded in the `.pt` file, so you can always tell which model you have.
+
+These numbers are reproducible: `--seed` seeds the dataset, the train/val
+split, and the weight init. Verified by running the same command twice and
+getting an identical dataset hash and identical metrics to six decimals.
+
+The AP curve shows the detection head actually learning rather than sitting at
+a constant:
+
+```
+epoch   1  2  3  4  5  6     7     8 ... 18    20
+AP@0.5  0  0  0  .02 0  .62  .99   .99 ... .99   .98
+mIoU   .48 .57 .75 .84 .80 .92  .92   .92 ... .95   .95
 ```
 
-> **These numbers do not reproduce run to run, and that is a known defect.**
-> Nothing in the training path is seeded — not the dataset, not the train/val
-> split, not the weight init — so two runs of the same command diverge. Two
-> 128-sample / 5-epoch runs measured `val_mIoU` 0.208 and 0.000. Adding
-> `--seed` is tracked in `AUDIT.md`.
->
-> Two further caveats, also in `AUDIT.md`: "mIoU" is foreground-only rather
-> than a true mean over classes, and "Detection IoU" is localisation error on
-> a single-object synthetic task, not AP.
+Model selection picked **epoch 18**, not epoch 20 — the last two epochs were
+slightly worse, which the previous "best = last epoch" logic would have missed.
+
+> `det_iou` is also reported, but treat it as a coarse sanity check only: it
+> compares just the top-scoring detection against the *first* ground-truth box,
+> so it reads low on multi-object frames even when AP is near 1.0. AP@0.5 is
+> the metric that matters.
 
 
 ---
@@ -274,23 +298,27 @@ Dashboard at `http://localhost:3000`.
 ```bash
 pip install -e ".[dev]"
 
-pytest          # 32 tests — path resolution, manifest portability,
-                # checkpoint guards, training validation, API contract
+pytest          # 80 tests — path resolution, manifest portability and
+                # reproducibility, GT consistency, detection targets and
+                # decoding, metric correctness, checkpoint guards, and the
+                # API contract including its error paths
 ruff check src tests
 ```
 
 The suite covers the failure modes this project previously shipped with: cwd-
 dependent artifact paths, manifests carrying another machine's absolute paths,
-checkpoints from a different architecture loading silently, and the trainer
-crashing on ordinary arguments.
+checkpoints from a different architecture loading silently, the trainer
+crashing on ordinary arguments, and malformed uploads returning 500.
 
 | Test module | Covers |
 |---|---|
 | `tests/test_paths.py` | Repo-anchored artifacts, env override, no import side effects |
-| `tests/test_data.py` | Relative manifest paths, portability, label ranges |
+| `tests/test_data.py` | Relative manifest paths, seeding, GT/box agreement, depth realism |
+| `tests/test_detection.py` | Heatmap targets, NMS, decode round-trip, box maths |
+| `tests/test_metrics.py` | Per-class mIoU incl. the 0/0 case, AP against hand-computed values |
 | `tests/test_checkpoint.py` | Metadata, round-trip, stale-architecture rejection |
-| `tests/test_training.py` | Argument validation, result reporting |
-| `tests/test_api.py` | `/health` readiness, `/predict` response contract |
+| `tests/test_training.py` | Argument validation, split seeding, val-based selection |
+| `tests/test_api.py` | `/health` readiness, response contract, 400/413/422 paths |
 
 ---
 
@@ -300,27 +328,71 @@ crashing on ordinary arguments.
 
 Accepts a single image file and returns multi-task inference results.
 
-**Request**: `multipart/form-data` with field `file` (JPEG or PNG).
+**Request**: `multipart/form-data` with field `file` (PNG, JPEG, or WebP).
+
+The frame is **letterboxed** into the 128×128 model input rather than squashed,
+so returned geometry maps back onto the original image without distortion.
 
 **Response** (JSON):
 
 ```json
 {
+  "detections": [
+    {
+      "x_px": 120.5, "y_px": 88.0, "w_px": 64.0, "h_px": 48.0,
+      "x": 0.188, "y": 0.183, "w": 0.1, "h": 0.1,
+      "score": 0.87, "class": 0
+    }
+  ],
   "score": 0.87,
-  "bbox": { "x": 0.42, "y": 0.51, "w": 0.18, "h": 0.22 },
-  "depth_b64": "<base64-encoded PNG — viridis colormap>",
-  "seg_b64": "<base64-encoded PNG — binary mask>",
-  "input_b64": "<base64-encoded PNG — original frame>"
+  "image_size": { "width": 640, "height": 480 },
+  "depth_b64": "<base64 PNG — viridis>",
+  "seg_b64": "<base64 PNG — JET mask>",
+  "input_b64": "<base64 PNG — letterboxed frame with boxes drawn>"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `score` | Detection confidence `[0, 1]` |
-| `bbox` | Normalized bounding box (cx, cy, w, h) |
-| `depth_b64` | Depth map rendered via Matplotlib viridis colormap |
-| `seg_b64` | Binary segmentation mask |
-| `input_b64` | Echo of the input frame |
+| `detections` | 0..N boxes, sorted by descending score |
+| `detections[].x_px` … | Box in **original image pixels** (top-left origin) |
+| `detections[].x` … | Same box normalised to `[0,1]` of the original image |
+| `detections[].score` | Detection confidence `[0, 1]` |
+| `score` | Convenience: the top detection's score, or `0.0` if none |
+| `image_size` | Original upload dimensions, so clients can scale overlays |
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | Empty body, unknown magic bytes, or an undecodable image |
+| `413` | Over 10 MB, or over 16 megapixels |
+| `422` | Missing the `file` field |
+
+### `GET /health`
+
+Readiness probe. Reports the checkpoint that is actually loaded, not a
+hardcoded `ok`:
+
+```json
+{
+  "status": "ready",
+  "arch_version": "big-per-camera-net-v2",
+  "checkpoint_arch_version": "big-per-camera-net-v2",
+  "checkpoint_epoch": 14,
+  "device": "cpu",
+  "input_size": 128,
+  "cors_origins": ["http://localhost:3000"]
+}
+```
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PER_CAMERA_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated CORS allowlist |
+| `PC_POC_ARTIFACTS` | `<repo>/artifacts` | Where checkpoints and data live |
+| `VITE_API_URL` (UI) | `/api` (Vite proxy) | API base URL for the dashboard |
 
 ---
 
@@ -345,11 +417,19 @@ The React dashboard provides three input modes and three output panels:
 | Priority | Item |
 |---|---|
 | High | Replace synthetic data with real RGBD camera streams |
-| High | Add FPN neck for multi-scale detection on real scenes |
+| High | Multi-class detection (the head already supports `C` classes; the generator emits one) |
+| High | Per-frame stream cancellation and an in-flight guard in the dashboard |
+| Medium | Add FPN neck for multi-scale detection on real scenes |
 | Medium | Integrate TensorRT / ONNX Runtime for edge deployment |
 | Medium | Docker Compose manifest (API + UI) for one-command deploy |
+| Medium | GitHub Actions: ruff + pytest + `vite build` on every PR |
 | Low | Multi-camera synchronization and stereo depth fusion |
 | Low | Continuous training loop with online hard example mining |
+
+Done and no longer on this list: repo-anchored artifact paths, fail-loud
+checkpoint loading, pinned dependencies, seeded reproducible runs,
+validation-based model selection, multi-object detection with real AP, and
+input validation on the API. See `AUDIT.md` for the full history.
 
 ---
 

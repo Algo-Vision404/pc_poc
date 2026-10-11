@@ -22,13 +22,32 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from .data import PerCameraDataset, build_transform  # noqa: E402
+from .detection import decode_detections  # noqa: E402
 from .model import BigPerCameraNet  # noqa: E402
 from .paths import CHECKPOINT_PATH, IMG_SIZE, MANIFEST_PATH, RESULTS_DIR, ensure_artifact_dirs  # noqa: E402
 from .training import load_checkpoint  # noqa: E402
 
+SCORE_THRESHOLD = 0.2
+
 
 def unnormalize(tensor: torch.Tensor) -> torch.Tensor:
     return tensor * 0.5 + 0.5
+
+
+def _rect(ax, box, color, linestyle="-", label=None):  # noqa: ANN001
+    xc, yc, w, h = box
+    ax.add_patch(
+        patches.Rectangle(
+            ((xc - w / 2) * IMG_SIZE, (yc - h / 2) * IMG_SIZE),
+            w * IMG_SIZE,
+            h * IMG_SIZE,
+            linewidth=2,
+            edgecolor=color,
+            facecolor="none",
+            linestyle=linestyle,
+            label=label,
+        )
+    )
 
 
 def render_samples(
@@ -40,7 +59,8 @@ def render_samples(
         img = sample["image"].unsqueeze(0).to(device)
         gt_seg = sample["seg"].numpy()
         gt_depth = sample["depth"].squeeze(0).numpy()
-        gt_bbox = sample["ann"]["bbox"].numpy()
+        gt_mask = sample["ann"]["box_mask"].numpy() > 0.5
+        gt_boxes = sample["ann"]["boxes"].numpy()[gt_mask][:, 1:5]
 
         with torch.no_grad():
             out = model(img)
@@ -52,59 +72,50 @@ def render_samples(
                 out["depth"], size=gt_depth.shape, mode="bilinear", align_corners=False
             )
             pred_depth = depth_up.squeeze(0).squeeze(0).cpu().numpy()
-            pred_bbox = out["det"][:, 1:5].squeeze(0).cpu().numpy()
+            dets = decode_detections(out["heatmap"], out["offset"], out["size"])[0].cpu().numpy()
 
-        print(f"Sample {i}")
-        print(" GT Seg unique:", np.unique(gt_seg))
-        print(" Pred Seg unique:", np.unique(pred_seg))
+        dets = dets[dets[:, 4] >= SCORE_THRESHOLD]
 
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        print(
+            f"Sample {i}: {len(gt_boxes)} GT box(es), {len(dets)} detection(s), "
+            f"seg unique {np.unique(pred_seg)}"
+        )
+
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
 
         disp_img = np.clip(unnormalize(sample["image"]).permute(1, 2, 0).numpy(), 0, 1)
         axes[0].imshow(disp_img)
-        axes[0].set_title("Input Image & Detection")
+        axes[0].set_title(f"Input ({len(gt_boxes)} GT / {len(dets)} pred)")
         axes[0].axis("off")
-
-        gt_xc, gt_yc, gt_w, gt_h = gt_bbox
-        axes[0].add_patch(
-            patches.Rectangle(
-                ((gt_xc - gt_w / 2) * IMG_SIZE, (gt_yc - gt_h / 2) * IMG_SIZE),
-                gt_w * IMG_SIZE,
-                gt_h * IMG_SIZE,
-                linewidth=2,
-                edgecolor="g",
-                facecolor="none",
-                label="GT",
-            )
-        )
-
-        pred_xc, pred_yc, pred_w, pred_h = pred_bbox
-        axes[0].add_patch(
-            patches.Rectangle(
-                ((pred_xc - pred_w / 2) * IMG_SIZE, (pred_yc - pred_h / 2) * IMG_SIZE),
-                pred_w * IMG_SIZE,
-                pred_h * IMG_SIZE,
-                linewidth=2,
-                edgecolor="r",
-                facecolor="none",
-                label="Pred",
+        for box in gt_boxes:
+            _rect(axes[0], box, "g", label="GT" if box is gt_boxes[0] else None)
+        for j, det in enumerate(dets):
+            _rect(
+                axes[0],
+                det[:4],
+                "r",
                 linestyle="--",
+                label=f"Pred {det[4]:.2f}" if j == 0 else None,
             )
-        )
-        axes[0].legend()
+        axes[0].legend(fontsize=8)
 
         axes[1].imshow(gt_seg, cmap="gray")
-        axes[1].set_title("Ground Truth Segmentation")
+        axes[1].set_title("GT Segmentation")
         axes[1].axis("off")
 
         axes[2].imshow(pred_seg, cmap="gray")
-        axes[2].set_title("Predicted Segmentation")
+        axes[2].set_title("Pred Segmentation")
         axes[2].axis("off")
 
-        im = axes[3].imshow(pred_depth, cmap="viridis")
-        axes[3].set_title("Predicted Depth")
+        im_gt = axes[3].imshow(gt_depth, cmap="viridis", vmin=0, vmax=1)
+        axes[3].set_title("GT Depth")
         axes[3].axis("off")
-        plt.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+        plt.colorbar(im_gt, ax=axes[3], fraction=0.046, pad=0.04)
+
+        im_pred = axes[4].imshow(pred_depth, cmap="viridis", vmin=0, vmax=1)
+        axes[4].set_title("Pred Depth")
+        axes[4].axis("off")
+        plt.colorbar(im_pred, ax=axes[4], fraction=0.046, pad=0.04)
 
         save_path = RESULTS_DIR / f"sample_{i:03d}.png"
         plt.savefig(save_path, dpi=150, bbox_inches="tight")

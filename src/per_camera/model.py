@@ -1,4 +1,10 @@
-"""BigPerCameraNet — ResNet-style backbone with three task heads."""
+"""BigPerCameraNet — ResNet-style backbone with three task heads.
+
+Detection is anchor-free and CenterNet-style: a per-pixel class heatmap plus
+sub-pixel offset and object-size regression at stride 4. That supports 0..N
+objects per frame and yields a real confidence score, unlike the previous
+single global box which could only ever regress one rectangle.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,15 @@ import torch.nn as nn
 #: Bumped whenever the module layout or shapes change. Stored in every
 #: checkpoint and asserted on load so a stale checkpoint fails loudly at
 #: startup instead of returning plausible-looking garbage at inference time.
-ARCH_VERSION = "big-per-camera-net-v1"
+#:
+#: v2: detection head replaced (single box -> heatmap + offset + size).
+ARCH_VERSION = "big-per-camera-net-v2"
+
+#: Detection head output stride relative to the input.
+DET_STRIDE = 4
+
+#: Prior bias for the heatmap so it starts near-zero under a sigmoid.
+HEATMAP_BIAS_INIT = -2.19
 
 
 class ResidualBlock(nn.Module):
@@ -42,11 +56,13 @@ class ResidualBlock(nn.Module):
 
 
 class BigPerCameraNet(nn.Module):
-    """Multi-task network producing segmentation, depth, and a detection box."""
+    """Multi-task network producing segmentation, depth, and detections."""
 
-    def __init__(self) -> None:
+    def __init__(self, num_classes: int = 1) -> None:
         super().__init__()
         self.arch_version = ARCH_VERSION
+        self.num_classes = num_classes
+        self.det_stride = DET_STRIDE
         self.in_channels = 64
 
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -74,16 +90,18 @@ class BigPerCameraNet(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Detection head: strided convolutions preserve spatial structure all
-        # the way to a 4x4x32 map, which flattens to 512 features.
-        self.det_features = nn.Sequential(
-            nn.Conv2d(128, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * 4 * 4, 256), nn.ReLU(), nn.Dropout(0.3),
+        # Shared detection trunk, upsampled from stride 8 to stride 4 so the
+        # heatmap has enough resolution for small objects.
+        self.det_trunk = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(64, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
         )
-        self.det_cls = nn.Linear(256, 1)
-        self.det_bbox = nn.Sequential(nn.Linear(256, 4), nn.Sigmoid())
+        self.det_heatmap = nn.Conv2d(32, num_classes, 1)
+        self.det_offset = nn.Conv2d(32, 2, 1)
+        self.det_size = nn.Conv2d(32, 2, 1)
+
+        nn.init.constant_(self.det_heatmap.bias, HEATMAP_BIAS_INIT)
 
     def _make_layer(self, out_channels: int, blocks: int, stride: int = 1) -> nn.Sequential:
         layers = [ResidualBlock(self.in_channels, out_channels, stride)]
@@ -98,9 +116,11 @@ class BigPerCameraNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         features = self.backbone(x)
-        det_feats = self.det_features(features)
+        det = self.det_trunk(features)
         return {
             "seg": self.seg(features),
             "depth": self.depth(features),
-            "det": torch.cat([self.det_cls(det_feats), self.det_bbox(det_feats)], dim=1),
+            "heatmap": self.det_heatmap(det),
+            "offset": self.det_offset(det),
+            "size": self.det_size(det),
         }
