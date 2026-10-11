@@ -42,6 +42,30 @@ Only `VITE_`-prefixed variables reach browser code.
 | `npm run build` | Production bundle to `dist/` |
 | `npm run preview` | Serve the built bundle locally |
 | `npm run lint` | ESLint |
+| `npm test` | Vitest, single run (CI) |
+| `npm run test:watch` | Vitest in watch mode |
+
+## Tests
+
+`npm test` runs 34 tests across three files:
+
+| File | Covers |
+|---|---|
+| `src/lib/api.test.js` | The request contract: multipart shape, `ApiError` carrying the HTTP status, the API's `detail` message surfacing, non-JSON error bodies falling back to the status line, and aborts propagating unwrapped so a superseded frame stays quiet |
+| `src/lib/synthetic.js` tests | That each class draws its own silhouette — a block a rect, a sphere an inscribed ellipse, a triangle an apex-top path — that frames stay in bounds, that empty frames occur, and that all three classes appear over many frames |
+| `src/App.test.jsx` | The dashboard end to end through a stubbed `fetch`: the checkpoint badge, error banners, the confidence filter, per-class counts, and box colours |
+
+The synthetic-frame generator mirrors `per_camera.data`, so those shape tests
+are what keep the demo stream in-distribution. If a class is added to
+`classes.py`, the generator and its tests must follow or the demo silently
+feeds the model a distribution it was never trained on.
+
+jsdom has no canvas backend. Rather than depend on the native `canvas` package
+(which needs a C compiler at install time), `src/test/setup.js` substitutes a
+2D context that records calls. The tests therefore assert *which drawing calls
+were made* — that a sphere issues `ellipse`, a triangle issues `moveTo`/`lineTo`
+/`closePath` — rather than pixel output, which would test the rasteriser and
+not this code.
 
 ## How it talks to the backend
 

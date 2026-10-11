@@ -1,13 +1,7 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import './index.css';
-
-// Never hardcode the backend origin: the dashboard is served from a different
-// host in every real deployment. Falls back to the Vite dev proxy.
-const API_URL = import.meta.env.VITE_API_URL ?? '/api';
-
-// Mirrors SEG_PALETTE in per_camera/classes.py so a box and its segmentation
-// mask are the same colour. Indexed by class_id.
-const CLASS_COLORS = ['#ef4444', '#22c55e', '#3b82f6'];
+import { predict, health, classColor, ApiError } from './lib/api.js';
+import { createSyntheticFrame, canvasToBlob, CLASS_NAMES } from './lib/synthetic.js';
 
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
@@ -18,6 +12,9 @@ function App() {
   
   // Surfaced in the UI instead of an alert(), and cleared on the next success.
   const [error, setError] = useState(null);
+  // What the server is actually running, so a stale or missing checkpoint is
+  // visible before you send a frame.
+  const [serverInfo, setServerInfo] = useState(null);
 
   // Webcam & Stream references
   const videoRef = useRef(null);
@@ -31,37 +28,29 @@ function App() {
   // rather than queued.
   const inFlightRef = useRef(false);
 
-  // Generate synthetic frame on a canvas
-  const createSyntheticFrame = (canvas) => {
-    canvas.width = 128;
-    canvas.height = 128;
-    const ctx = canvas.getContext('2d');
-    
-    // Background
-    ctx.fillStyle = '#1e1e1e';
-    ctx.fillRect(0, 0, 128, 128);
-    
-    // Random rect
-    const w = Math.floor(Math.random() * 28) + 12;
-    const h = Math.floor(Math.random() * 28) + 12;
-    const x = Math.floor(Math.random() * (128 - w));
-    const y = Math.floor(Math.random() * (128 - h));
-    
-    const r = Math.floor(Math.random() * 195) + 60;
-    const g = Math.floor(Math.random() * 195) + 60;
-    const b = Math.floor(Math.random() * 195) + 60;
-    
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(x, y, w, h);
-    return canvas;
-  };
+  useEffect(() => {
+    // Best-effort: a failed probe is shown, not thrown. Aborted on unmount so
+    // a slow probe cannot setState on a component that is already gone.
+    const controller = new AbortController();
+    health({ signal: controller.signal })
+      .then(setServerInfo)
+      .catch((err) => {
+        if (err.name === 'AbortError') return;
+        setError(err instanceof ApiError ? err.message : 'Backend unreachable');
+      });
+    return () => controller.abort();
+  }, []);
 
   const generateDemoImage = () => {
     if (isStreaming || isWebcamActive) stopAllStreams();
     const canvas = document.createElement('canvas');
     createSyntheticFrame(canvas);
     
-    canvas.toBlob((blob) => {
+    canvasToBlob(canvas).then((blob) => {
+      if (!blob) {
+        setError('Could not encode the demo frame.');
+        return;
+      }
       const file = new File([blob], 'demo.png', { type: 'image/png' });
       handleFileChange({ target: { files: [file] } });
     });
@@ -81,34 +70,48 @@ function App() {
     }
   };
 
-  const performPrediction = async (fileToPredict, signal) => {
-    const formData = new FormData();
-    formData.append('file', fileToPredict);
-    const res = await fetch(`${API_URL}/predict`, { method: 'POST', body: formData, signal });
-    if (!res.ok) {
-      let detail = '';
-      try {
-        detail = (await res.json()).detail ?? '';
-      } catch {
-        /* non-JSON error body */
-      }
-      throw new Error(detail || `Backend returned ${res.status}`);
-    }
-    return res.json();
-  };
-
   const handlePredict = async () => {
     if (!selectedFile) return;
     setLoading(true);
     setError(null);
     try {
-      setResults(await performPrediction(selectedFile));
+      setResults(await predict(selectedFile));
     } catch (err) {
       if (err.name !== 'AbortError') setError(err.message);
     } finally {
       setLoading(false);
     }
   };
+
+  /**
+   * Send one stream frame. Shared by the synthetic and webcam modes.
+   *
+   * Returns false when the tick was dropped or the frame could not be encoded,
+   * so the caller never leaves the in-flight guard stuck on.
+   */
+  const sendStreamFrame = useCallback(async (canvas) => {
+    const blob = await canvasToBlob(canvas);
+    if (!blob) {
+      setError('Could not encode the capture frame.');
+      return false;
+    }
+
+    // A newer frame supersedes whatever is still pending.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const file = new File([blob], 'frame.png', { type: 'image/png' });
+      setResults(await predict(file, { signal: controller.signal }));
+      setError(null);
+      return true;
+    } catch (err) {
+      // Aborts are expected here — they mean a newer frame arrived.
+      if (err.name !== 'AbortError') setError(err.message);
+      return false;
+    }
+  }, []);
 
   // Live Stream Logic
   const toggleSyntheticStream = () => {
@@ -118,30 +121,20 @@ function App() {
       stopAllStreams();
       setIsStreaming(true);
       setError(null);
-      streamIntervalRef.current = setInterval(() => {
+      streamIntervalRef.current = setInterval(async () => {
         // Drop the tick instead of queueing it. Without this guard a slow
         // backend makes requests pile up and they resolve out of order, so a
         // stale frame can overwrite a newer one on screen.
         if (inFlightRef.current) return;
         inFlightRef.current = true;
-
-        const canvas = document.createElement('canvas');
-        createSyntheticFrame(canvas);
-        setPreview(canvas.toDataURL('image/png'));
-        canvas.toBlob(async (blob) => {
-          abortRef.current?.abort();
-          const controller = new AbortController();
-          abortRef.current = controller;
-          try {
-            const file = new File([blob], 'stream.png', { type: 'image/png' });
-            setResults(await performPrediction(file, controller.signal));
-            setError(null);
-          } catch (err) {
-            if (err.name !== 'AbortError') setError(err.message);
-          } finally {
-            inFlightRef.current = false;
-          }
-        });
+        try {
+          const canvas = document.createElement('canvas');
+          createSyntheticFrame(canvas);
+          setPreview(canvas.toDataURL('image/png'));
+          await sendStreamFrame(canvas);
+        } finally {
+          inFlightRef.current = false;
+        }
       }, 500); // 2 FPS
     }
   };
@@ -166,14 +159,17 @@ function App() {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 640 }, height: { ideal: 480 } },
       });
-      if (!videoRef.current) return;
+      if (!videoRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
 
       videoRef.current.srcObject = stream;
       await videoRef.current.play().catch(() => undefined);
       setIsWebcamActive(true);
       setError(null);
 
-      streamIntervalRef.current = setInterval(() => {
+      streamIntervalRef.current = setInterval(async () => {
         const video = videoRef.current;
         const canvas = streamCanvasRef.current;
         if (!video || !canvas || video.readyState < 2 || inFlightRef.current) return;
@@ -186,20 +182,11 @@ function App() {
 
         setPreview(canvas.toDataURL('image/png'));
         inFlightRef.current = true;
-        canvas.toBlob(async (blob) => {
-          abortRef.current?.abort();
-          const controller = new AbortController();
-          abortRef.current = controller;
-          try {
-            const file = new File([blob], 'webcam.png', { type: 'image/png' });
-            setResults(await performPrediction(file, controller.signal));
-            setError(null);
-          } catch (err) {
-            if (err.name !== 'AbortError') setError(err.message);
-          } finally {
-            inFlightRef.current = false;
-          }
-        });
+        try {
+          await sendStreamFrame(canvas);
+        } finally {
+          inFlightRef.current = false;
+        }
       }, 1000); // 1 FPS
     } catch (err) {
       console.error('Webcam error:', err);
@@ -241,6 +228,13 @@ function App() {
       <header className="header">
         <h1>Per-Camera PoC Intelligence</h1>
         <p>Real-time autonomous perception command center.</p>
+        {/* Shows which checkpoint is actually loaded. Without this, a stale or
+            randomly-initialised model is indistinguishable from a good one. */}
+        <div className="server-badge" data-testid="server-badge">
+          {serverInfo
+            ? `${serverInfo.arch_version ?? 'unknown'} · epoch ${serverInfo.checkpoint_epoch ?? '?'} · ${serverInfo.device ?? '?'}`
+            : 'connecting to backend…'}
+        </div>
       </header>
 
       <main className="main-content">
@@ -264,11 +258,15 @@ function App() {
             </div>
             
             <div className="slider-section" style={{width: '100%', marginTop: '1.5rem'}}>
-              <label>Confidence Threshold: {(confidenceThreshold * 100).toFixed(0)}%</label>
-              <input 
-                type="range" 
-                min="0" max="1" step="0.05" 
-                value={confidenceThreshold} 
+              <label htmlFor="confidence-threshold">
+                Confidence Threshold: {(confidenceThreshold * 100).toFixed(0)}%
+              </label>
+              <input
+                id="confidence-threshold"
+                aria-label="Confidence threshold"
+                type="range"
+                min="0" max="1" step="0.05"
+                value={confidenceThreshold}
                 onChange={e => setConfidenceThreshold(parseFloat(e.target.value))}
                 style={{width: '100%', marginTop: '0.5rem'}}
               />
@@ -317,6 +315,26 @@ function App() {
                     </strong>
                   </div>
               </div>
+
+              {/* Per-class counts over the filtered set, so a model that has
+                  quietly stopped seeing one class is visible at a glance. */}
+              {visibleDetections.length > 0 && (
+                <div className="class-breakdown">
+                  {CLASS_NAMES.map((name, i) => {
+                    const n = visibleDetections.filter((d) => d.class_id === i).length;
+                    return (
+                      <span
+                        key={name}
+                        className="class-chip"
+                        style={{ borderColor: classColor(i), opacity: n ? 1 : 0.4 }}
+                      >
+                        <i style={{ background: classColor(i) }} />
+                        {name} <b>{n}</b>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
               
               <div className="grid-display">
                 <div className="grid-item">
@@ -324,7 +342,7 @@ function App() {
                   <div style={{position: 'relative', width: '100%'}}>
                     <img src={preview || `data:image/png;base64,${results.input_b64}`} alt="Detection" />
                     {visibleDetections.map((det, i) => {
-                      const color = CLASS_COLORS[det.class_id] ?? '#ef4444';
+                      const color = classColor(det.class_id);
                       return (
                         <div
                           key={i}

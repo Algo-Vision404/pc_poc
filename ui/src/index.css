@@ -284,3 +284,41 @@ input[type=range]::-webkit-slider-runnable-track {
 .error-banner strong {
   font-weight: 600;
 }
+
+/* Which checkpoint the backend actually loaded. */
+.server-badge {
+  display: inline-block;
+  margin-top: 0.5rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.04);
+  color: var(--text-muted, #64748b);
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Per-class detection counts. */
+.class-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.75rem 0 0.25rem;
+}
+
+.class-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--text-main, #0f172a);
+}
+
+.class-chip i {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+}
