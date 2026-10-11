@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from .classes import CLASS_NAMES, NUM_CLASSES, NUM_SEG_CLASSES
 from .data import PerCameraDataset, build_transform, collate_fn, generate_synthetic_dataset
 from .detection import SIZE_LOSS_WEIGHT, focal_loss, reg_l1_loss
 from .metrics import evaluate
@@ -57,7 +58,7 @@ def val_score(metrics: dict[str, float]) -> float:
     Higher is better. Combines the two detection/segmentation quality signals
     and penalises depth error.
     """
-    return metrics["mIoU"] + metrics["ap50"] - metrics["rmse"]
+    return metrics["mIoU"] + metrics["map50"] - metrics["rmse"]
 
 
 def _configure_stdout() -> None:
@@ -255,14 +256,26 @@ def train(
 
         scheduler.step()
 
-        metrics = evaluate(model, val_loader, device)
+        metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            num_seg_classes=NUM_SEG_CLASSES,
+            num_det_classes=NUM_CLASSES,
+        )
         avg_train_loss = epoch_loss / len(train_loader)
         score = val_score(metrics)
 
         history.append({"epoch": epoch + 1, "train_loss": avg_train_loss, **metrics})
+        per_class = " ".join(
+            f"{CLASS_NAMES[c]}={metrics[f'ap50_class{c}']:.3f}"
+            for c in range(NUM_CLASSES)
+            if f"ap50_class{c}" in metrics
+        )
         print(
             f"Epoch {epoch + 1}/{epochs} - Loss: {avg_train_loss:.4f} "
-            f"- Val mIoU: {metrics['mIoU']:.4f} - Val AP50: {metrics['ap50']:.4f} "
+            f"- Val mIoU: {metrics['mIoU']:.4f} - Val mAP50: {metrics['map50']:.4f} "
+            f"({per_class}) "
             f"- Val RMSE: {metrics['rmse']:.4f} - Val AbsRel: {metrics['abs_rel']:.4f}"
         )
 

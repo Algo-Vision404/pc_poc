@@ -22,8 +22,8 @@ This project evolved from a lightweight single-task PoC (`TinyPerCameraNet`) int
 
 - **Anchor-free detection head** — a CenterNet-style heatmap plus sub-pixel offset and size regression at stride 4, so the model emits 0..N boxes per frame and a confidence score worth thresholding. (The earlier head flattened the feature map and regressed one box through an FC layer, which structurally capped it at a single detection.)
 - **A real depth field** — the background carries a receding ground plane and each object has its own depth, cued by size *and* aerial-perspective brightness. Previously depth was a constant inside the object and zero outside, which made it the segmentation mask plus one scalar that was a pure function of box area — a shortcut, not a depth signal.
-- **Multi-object scenes with empty frames** — 0–3 objects per frame, ~20% empty, painted far-to-near for occlusion. Empty frames are what give the classification head a negative class to learn.
-- **Honest metrics** — true per-class mIoU (not foreground-only), AP@0.5 with proper precision/recall, and AbsRel for depth.
+- **Multi-object, multi-class scenes** — 0–3 objects per frame, ~20% empty, painted far-to-near for occlusion. Three classes (`block`, `sphere`, `triangle`) each have a distinct silhouette and hue family, so detection is genuinely class-aware and the segmentation head has four labels rather than two. Empty frames are what give the classifier a negative class to learn.
+- **Honest metrics** — true per-class mIoU (not foreground-only), class-aware **mAP@0.5** with per-class AP and precision/recall, mean IoU of matched detections for localisation quality, and AbsRel for depth.
 - **Reproducible runs** — `--seed` seeds the dataset, the train/val split, and the weight init. Checkpoints are selected on validation quality, with early stopping.
 - **Production stack** — FastAPI inference API + React/Vite dashboard with live streaming support.
 
@@ -99,6 +99,12 @@ lifts each back to image coordinates using its offset and size.
 > object with a hardcoded class label of `1`, the classifier was trained on a
 > constant target and its "confidence" carried no information. The heatmap head
 > handles 0..N objects and produces a score worth thresholding.
+
+The head has always taken a class count `C`, but until v3 the dataset only ever
+emitted class 0 — so `C` was a parameter with one legal value and per-class AP
+was untestable. The generator now emits three classes with distinct shapes, the
+heatmap has three channels, and the segmentation head has four (background
+plus three).
 
 ### Multi-Task Loss
 
@@ -183,14 +189,26 @@ repository — **never** to the current working directory. Override it with
 
 ## Performance
 
-Reference run — `--samples 512 --epochs 20 --batch 32 --seed 0`, CPU, torch 2.14.1:
+Reference run — `--samples 512 --epochs 20 --batch 32 --seed 0`, CPU, torch 2.14.1,
+architecture `big-per-camera-net-v3`. Source: `artifacts/results/poc_results.json`.
 
 | Metric | Value | Notes |
 |---|---|---|
-| **Detection AP@0.5** | **0.988** | precision 1.000, recall 0.988 |
-| **Segmentation mIoU** | **0.952** | true mean over both classes |
-| **Depth RMSE** | **0.040** | on a dense depth field in `[0, 1]` |
-| **Depth AbsRel** | **0.043** | scale-invariant relative error |
+| **Detection mAP@0.5** | **0.995** | recall 0.995, precision 0.952 |
+| — AP `block` | 1.000 | per-class |
+| — AP `sphere` | 0.984 | the hardest: curved silhouette, no box-aligned edges |
+| — AP `triangle` | 1.000 | per-class |
+| **Matched IoU** | **0.808** | mean IoU of the detections that matched a GT box |
+| **Segmentation mIoU** | **0.874** | true mean over **4** labels (background + 3 classes) |
+| **Depth RMSE** | **0.037** | on a dense depth field in `[0, 1]` |
+| **Depth AbsRel** | **0.039** | scale-invariant relative error |
+
+Model selection picked **epoch 19** of 20.
+
+> **mIoU is not comparable with the pre-v3 figure of 0.952.** That number was a
+> mean over two labels (background + one object class); this one is a mean over
+> four. Averaging in three object classes instead of one mechanically lowers the
+> mean — the drop is a change in what the metric measures, not a regression.
 
 Every run writes `artifacts/results/poc_results.json` with the full per-epoch
 history, and that file — not this README — is the source of truth. Checkpoint
@@ -201,22 +219,23 @@ These numbers are reproducible: `--seed` seeds the dataset, the train/val
 split, and the weight init. Verified by running the same command twice and
 getting an identical dataset hash and identical metrics to six decimals.
 
-The AP curve shows the detection head actually learning rather than sitting at
-a constant:
+The mAP curve shows the detection head actually learning rather than sitting at
+a constant, and doing so for all three classes rather than one:
 
 ```
-epoch   1  2  3  4  5  6     7     8 ... 18    20
-AP@0.5  0  0  0  .02 0  .62  .99   .99 ... .99   .98
-mIoU   .48 .57 .75 .84 .80 .92  .92   .92 ... .95   .95
+epoch    1   2   3   4    5    6    7    8    9   10   11   12 ... 19   20
+mAP50    0   0   0  .63  .87  .93  .96  .98  .99  .99  .99 1.00 ... .99 .99
+mIoU   .24 .24 .32  .47  .62  .65  .67  .67  .84  .85  .85  .86 ... .87 .86
 ```
 
-Model selection picked **epoch 18**, not epoch 20 — the last two epochs were
-slightly worse, which the previous "best = last epoch" logic would have missed.
-
-> `det_iou` is also reported, but treat it as a coarse sanity check only: it
-> compares just the top-scoring detection against the *first* ground-truth box,
-> so it reads low on multi-object frames even when AP is near 1.0. AP@0.5 is
-> the metric that matters.
+> The `det_iou` metric from earlier revisions is gone. It compared only the
+> top-scoring detection against the *first* ground-truth box, so a detector
+> that found every object correctly still read 0.44 while AP was 0.99 — a
+> number that looked like a localisation failure but measured nothing.
+> `matched_iou` replaces it: the mean IoU of the detections that actually
+> matched a ground-truth box, which is the localisation quality that metric was
+> trying to express. On this run it reads 0.808, which is what a detector at
+> mAP 0.995 actually localises like.
 
 
 ---
@@ -241,9 +260,9 @@ pip install -e .                          # installs the per_camera package + CL
 ### 2. Train the model
 
 ```bash
-python -m per_camera.training --samples 2048 --epochs 30 --batch 32
+python -m per_camera.training --samples 512 --epochs 20 --batch 32 --seed 0
 # or, equivalently:
-pc-poc-train --samples 2048 --epochs 30 --batch 32
+pc-poc-train --samples 512 --epochs 20 --batch 32 --seed 0
 ```
 
 | Argument | Default | Description |
@@ -252,6 +271,11 @@ pc-poc-train --samples 2048 --epochs 30 --batch 32
 | `--epochs` | 20 | Training epochs |
 | `--batch` | 16 | Batch size |
 | `--max_samples` | all | Cap the dataset size |
+| `--seed` | 0 | Seeds the dataset, the split, and the weight init |
+| `--patience` | 8 | Early-stopping patience, in epochs without improvement |
+
+The train/val split is a fixed 80/20. Expect roughly 20 minutes on CPU for
+512 samples over 20 epochs.
 
 Artifacts are written to `artifacts/` at the repo root (override with
 `PC_POC_ARTIFACTS`). This step is **required** before starting the API — there
@@ -289,6 +313,24 @@ npm run dev
 ```
 
 Dashboard at `http://localhost:3000`.
+
+### 6. Alternative: run it all with Docker
+
+```bash
+docker compose up --build api ui          # API on :8000, dashboard on :8080
+docker compose --profile train run train  # one-shot training run
+```
+
+`artifacts/` is a named volume shared by the API and the training container, so
+a checkpoint trained by the `train` service is picked up by the API without
+copying files around. The images install the CPU build of PyTorch and run as an
+unprivileged user; weights are **not** baked into the image, so you must run
+`train` (or mount a checkpoint) before the API will serve.
+
+> The container files are committed but could not be built in the environment
+> where they were written — Docker was unavailable. `docker compose config`
+> parses cleanly and every path the Dockerfiles reference exists, but treat the
+> first build as unverified.
 
 
 ---
@@ -341,13 +383,13 @@ so returned geometry maps back onto the original image without distortion.
     {
       "x_px": 120.5, "y_px": 88.0, "w_px": 64.0, "h_px": 48.0,
       "x": 0.188, "y": 0.183, "w": 0.1, "h": 0.1,
-      "score": 0.87, "class": 0
+      "score": 0.87, "class": "block", "class_id": 0
     }
   ],
   "score": 0.87,
   "image_size": { "width": 640, "height": 480 },
   "depth_b64": "<base64 PNG — viridis>",
-  "seg_b64": "<base64 PNG — JET mask>",
+  "seg_b64": "<base64 PNG — one colour per class>",
   "input_b64": "<base64 PNG — letterboxed frame with boxes drawn>"
 }
 ```
@@ -358,6 +400,8 @@ so returned geometry maps back onto the original image without distortion.
 | `detections[].x_px` … | Box in **original image pixels** (top-left origin) |
 | `detections[].x` … | Same box normalised to `[0,1]` of the original image |
 | `detections[].score` | Detection confidence `[0, 1]` |
+| `detections[].class` | Class name: `block`, `sphere`, or `triangle` |
+| `detections[].class_id` | Same class as an integer, for colour lookups |
 | `score` | Convenience: the top detection's score, or `0.0` if none |
 | `image_size` | Original upload dimensions, so clients can scale overlays |
 
@@ -377,11 +421,12 @@ hardcoded `ok`:
 ```json
 {
   "status": "ready",
-  "arch_version": "big-per-camera-net-v2",
-  "checkpoint_arch_version": "big-per-camera-net-v2",
+  "arch_version": "big-per-camera-net-v3",
+  "checkpoint_arch_version": "big-per-camera-net-v3",
   "checkpoint_epoch": 14,
   "device": "cpu",
   "input_size": 128,
+  "classes": ["block", "sphere", "triangle"],
   "cors_origins": ["http://localhost:3000"]
 }
 ```
@@ -417,19 +462,19 @@ The React dashboard provides three input modes and three output panels:
 | Priority | Item |
 |---|---|
 | High | Replace synthetic data with real RGBD camera streams |
-| High | Multi-class detection (the head already supports `C` classes; the generator emits one) |
-| High | Per-frame stream cancellation and an in-flight guard in the dashboard |
 | Medium | Add FPN neck for multi-scale detection on real scenes |
 | Medium | Integrate TensorRT / ONNX Runtime for edge deployment |
-| Medium | Docker Compose manifest (API + UI) for one-command deploy |
-| Medium | GitHub Actions: ruff + pytest + `vite build` on every PR |
+| Medium | Browser tests for the dashboard (the Python side has 84; the UI has none) |
 | Low | Multi-camera synchronization and stereo depth fusion |
 | Low | Continuous training loop with online hard example mining |
 
 Done and no longer on this list: repo-anchored artifact paths, fail-loud
 checkpoint loading, pinned dependencies, seeded reproducible runs,
-validation-based model selection, multi-object detection with real AP, and
-input validation on the API. See `AUDIT.md` for the full history.
+validation-based model selection, multi-object **and multi-class** detection
+with class-aware mAP, input validation on the API, per-frame stream
+cancellation with an in-flight guard, CI on every PR, containerised API + UI,
+and a clean dependency audit on both stacks. See `AUDIT.md` for the full
+history.
 
 ---
 

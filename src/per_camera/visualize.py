@@ -20,9 +20,14 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
+from matplotlib.colors import ListedColormap  # noqa: E402
 
+from .classes import SEG_PALETTE  # noqa: E402
 from .data import PerCameraDataset, build_transform  # noqa: E402
 from .detection import decode_detections  # noqa: E402
+
+#: One distinct colour per segmentation class (index 0 is background).
+_SEG_CMAP = ListedColormap([[c / 255 for c in rgb] for rgb in SEG_PALETTE])
 from .model import BigPerCameraNet  # noqa: E402
 from .paths import CHECKPOINT_PATH, IMG_SIZE, MANIFEST_PATH, RESULTS_DIR, ensure_artifact_dirs  # noqa: E402
 from .training import load_checkpoint  # noqa: E402
@@ -99,11 +104,12 @@ def render_samples(
             )
         axes[0].legend(fontsize=8)
 
-        axes[1].imshow(gt_seg, cmap="gray")
+        # Distinct colour per class; "gray" would make 0..3 nearly identical.
+        axes[1].imshow(gt_seg, cmap=_SEG_CMAP, vmin=0, vmax=len(SEG_PALETTE) - 1)
         axes[1].set_title("GT Segmentation")
         axes[1].axis("off")
 
-        axes[2].imshow(pred_seg, cmap="gray")
+        axes[2].imshow(pred_seg, cmap=_SEG_CMAP, vmin=0, vmax=len(SEG_PALETTE) - 1)
         axes[2].set_title("Pred Segmentation")
         axes[2].axis("off")
 

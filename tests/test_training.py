@@ -46,7 +46,7 @@ def test_results_report_the_new_metric_set(manifest):
     assert results["config"]["seed"] == 0
 
     metrics = results["best_metrics"]
-    for key in ("mIoU", "ap50", "rmse", "abs_rel", "det_iou"):
+    for key in ("mIoU", "map50", "rmse", "abs_rel", "matched_iou"):
         assert key in metrics, key
     assert len(results["history"]) == 1
 
@@ -68,9 +68,9 @@ def test_same_seed_reproduces_the_validation_split(manifest):
 
 
 def test_val_score_prefers_higher_iou_and_ap_and_lower_rmse():
-    base = {"mIoU": 0.5, "ap50": 0.5, "rmse": 0.1}
+    base = {"mIoU": 0.5, "map50": 0.5, "rmse": 0.1}
     assert val_score({**base, "mIoU": 0.9}) > val_score(base)
-    assert val_score({**base, "ap50": 0.9}) > val_score(base)
+    assert val_score({**base, "map50": 0.9}) > val_score(base)
     assert val_score({**base, "rmse": 0.01}) > val_score(base)
 
 

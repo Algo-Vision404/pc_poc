@@ -22,6 +22,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, UnidentifiedImageError
 
+from .classes import CLASS_NAMES, SEG_PALETTE, class_name
 from .data import build_transform
 from .detection import decode_detections
 from .model import ARCH_VERSION, BigPerCameraNet
@@ -78,7 +79,19 @@ def _to_b64_png(array: np.ndarray) -> str:
 
 
 def _colorize(mask: np.ndarray, colormap: int) -> np.ndarray:
+    """Colour a continuous field normalised to ``[0, 1]``."""
     return cv2.applyColorMap(np.clip(mask * 255, 0, 255).astype(np.uint8), colormap)
+
+
+def _colorize_labels(labels: np.ndarray) -> np.ndarray:
+    """Map class indices to BGR through the shared palette.
+
+    Routing labels through ``_colorize`` instead would multiply the class index
+    by 255 and clip, so classes 1, 2 and 3 all rendered as the same saturated
+    colour and a four-class mask came back single-coloured.
+    """
+    lut = np.array(SEG_PALETTE, dtype=np.uint8)[:, ::-1]  # RGB -> BGR
+    return lut[np.clip(labels, 0, len(lut) - 1).astype(int)]
 
 
 def _sniff_format(contents: bytes) -> str:
@@ -139,6 +152,7 @@ def health() -> dict:
         "checkpoint_epoch": CHECKPOINT_META.get("epoch"),
         "device": str(device),
         "input_size": IMG_SIZE,
+        "classes": list(CLASS_NAMES),
         "cors_origins": _origins,
     }
 
@@ -212,7 +226,8 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
                 "w": round(bw / orig_w, 6),
                 "h": round(bh / orig_h, 6),
                 "score": round(float(score), 4),
-                "class": int(cls),
+                "class": class_name(int(cls)),
+                "class_id": int(cls),
             }
         )
     detections.sort(key=lambda d: -d["score"])
@@ -236,7 +251,7 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
 
     return {
         "input_b64": _to_b64_png(overlay),
-        "seg_b64": _to_b64_png(_colorize(pred_seg, cv2.COLORMAP_JET)),
+        "seg_b64": _to_b64_png(_colorize_labels(pred_seg)),
         "depth_b64": _to_b64_png(_colorize(pred_depth, cv2.COLORMAP_VIRIDIS)),
         "detections": detections,
         "score": detections[0]["score"] if detections else 0.0,

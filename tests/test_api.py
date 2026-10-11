@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -97,3 +98,22 @@ def test_oversized_body_returns_413(client):
 def test_missing_field_returns_422(client):
     response = client.post("/predict", files={"image": ("a.png", _png(), "image/png")})
     assert response.status_code == 422
+
+
+def test_segmentation_colours_are_distinct_per_class():
+    """Regression: labels were passed through `mask * 255` + a JET colormap, so
+    classes 1, 2 and 3 all clipped to the same saturated colour and a
+    four-class mask came back single-coloured."""
+    from per_camera.api import _colorize_labels
+    from per_camera.classes import NUM_SEG_CLASSES
+
+    labels = np.arange(NUM_SEG_CLASSES, dtype=np.uint8).reshape(1, -1)
+    bgr = _colorize_labels(labels)
+
+    assert bgr.shape == (1, NUM_SEG_CLASSES, 3)
+    colours = [tuple(int(c) for c in bgr[0, i]) for i in range(NUM_SEG_CLASSES)]
+    assert len(set(colours)) == NUM_SEG_CLASSES, f"classes share a colour: {colours}"
+
+    # Out-of-range indices must clamp, not raise, so a stale checkpoint that
+    # emits an unexpected label still renders.
+    assert _colorize_labels(np.array([[99]], dtype=np.uint8)).shape == (1, 1, 3)

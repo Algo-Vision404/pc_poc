@@ -1,0 +1,47 @@
+# One-command deploy: API + dashboard behind a single nginx origin.
+#
+#   docker compose --profile train run --rm train   # first run only: build weights
+#   docker compose up --build                       # dashboard on :3000
+#
+# ./artifacts is bind-mounted so checkpoints and generated data live on the
+# host and survive container rebuilds. The API refuses to start without a
+# valid checkpoint — that is deliberate, see AUDIT.md finding #4.
+
+services:
+  api:
+    build: .
+    volumes:
+      - ./artifacts:/app/artifacts
+    environment:
+      # The browser reaches the API through the dashboard's nginx proxy, so it
+      # is same-origin and needs no CORS entry. Add origins here if you serve
+      # the dashboard from somewhere else.
+      PER_CAMERA_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # Not started by `docker compose up`. Run it explicitly to train.
+  train:
+    build: .
+    profiles: ["train"]
+    volumes:
+      - ./artifacts:/app/artifacts
+    command:
+      - pc-poc-train
+      - --samples
+      - "2048"
+      - --epochs
+      - "30"
+      - --batch
+      - "32"
+      - --seed
+      - "0"
+
+  ui:
+    build: ./ui
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped

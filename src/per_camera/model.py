@@ -11,12 +11,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .classes import NUM_CLASSES
+
 #: Bumped whenever the module layout or shapes change. Stored in every
 #: checkpoint and asserted on load so a stale checkpoint fails loudly at
 #: startup instead of returning plausible-looking garbage at inference time.
 #:
 #: v2: detection head replaced (single box -> heatmap + offset + size).
-ARCH_VERSION = "big-per-camera-net-v2"
+#: v3: multi-class — seg head emits NUM_CLASSES+1 channels, heatmap NUM_CLASSES.
+ARCH_VERSION = "big-per-camera-net-v3"
 
 #: Detection head output stride relative to the input.
 DET_STRIDE = 4
@@ -58,7 +61,7 @@ class ResidualBlock(nn.Module):
 class BigPerCameraNet(nn.Module):
     """Multi-task network producing segmentation, depth, and detections."""
 
-    def __init__(self, num_classes: int = 1) -> None:
+    def __init__(self, num_classes: int = NUM_CLASSES) -> None:
         super().__init__()
         self.arch_version = ARCH_VERSION
         self.num_classes = num_classes
@@ -78,7 +81,7 @@ class BigPerCameraNet(nn.Module):
             nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(32, 2, 1),
+            nn.Conv2d(32, num_classes + 1, 1),  # +1 for background
         )
 
         self.depth = nn.Sequential(

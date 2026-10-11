@@ -1,8 +1,10 @@
 """Synthetic dataset generation and the :class:`torch.utils.data.Dataset` wrapper.
 
-Frames contain 0-3 rectangles (empty frames included) over a receding ground
-plane. Ground truth is written as image / mask / depth-map triples plus a JSON
-box list, with paths stored relative to the manifest so it stays portable.
+Frames contain 0-3 objects (empty frames included) over a receding ground
+plane. Each object is one of the classes in :mod:`per_camera.classes`, with a
+distinct silhouette and hue, and nearer objects occlude farther ones. Ground
+truth is written as image / mask / depth-map triples plus a JSON box list, with
+paths stored relative to the manifest so it stays portable.
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+# The class vocabulary lives in classes.py, which breaks an import cycle:
+# data needs DET_STRIDE from model, and model needs the class count.
+from .classes import NUM_CLASSES
 from .detection import build_targets
 from .model import DET_STRIDE
 from .paths import DATA_DIR, IMG_SIZE, MANIFEST_PATH, ensure_artifact_dirs, resolve_manifest_path
@@ -26,10 +31,6 @@ MANIFEST_FIELDS = ["image", "seg", "depth", "boxes"]
 #: Mean/std used at train time and at serve time. Must stay identical.
 NORM_MEAN = (0.5, 0.5, 0.5)
 NORM_STD = (0.5, 0.5, 0.5)
-
-#: Detection classes. One class keeps the PoC honest; the head is written for N.
-NUM_CLASSES = 1
-CLASS_NAMES = ("object",)
 
 #: Scene composition.
 MAX_OBJECTS = 3
@@ -69,15 +70,63 @@ def _background(rng: np.random.Generator, size: int) -> tuple[np.ndarray, np.nda
     return rgb, depth
 
 
-def _object_color(rng: np.random.Generator, depth: float) -> tuple[int, int, int]:
-    """Brighter and more saturated when near; hazier when far.
+def _object_color(rng: np.random.Generator, depth: float, cls: int) -> tuple[int, int, int]:
+    """A per-class hue family, hazier when far and brighter when near.
 
-    This gives the depth head an appearance cue that is independent of size, so
-    depth cannot be recovered from bounding-box area alone.
+    Two independent cues: class identity from hue, depth from brightness. The
+    brightness term is what stops depth being recoverable from box area alone.
     """
-    base = rng.uniform(90, 255, size=3)
+    hue = (0.02, 0.35, 0.62)[cls]  # red-ish, green-ish, blue-ish
+    r, g, b = _hsv_to_rgb(hue, float(rng.uniform(0.55, 0.95)), float(rng.uniform(0.75, 1.0)))
     haze = 1.0 - 0.45 * depth
-    return tuple(int(np.clip(c * haze, 0, 255)) for c in base)
+    return (
+        int(np.clip(r * 255 * haze, 0, 255)),
+        int(np.clip(g * 255 * haze, 0, 255)),
+        int(np.clip(b * 255 * haze, 0, 255)),
+    )
+
+
+def _hsv_to_rgb(h: float, s: float, v: float) -> tuple[float, float, float]:
+    """Minimal HSV->RGB so the generator does not need a colour library."""
+    i = int(h * 6.0) % 6
+    f = h * 6.0 - int(h * 6.0)
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    return ((v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q))[i]
+
+
+def _mask_boundary(mask: np.ndarray) -> np.ndarray:
+    """One-pixel rim of ``mask``, drawn darker so edges survive downsampling."""
+    inner = np.zeros_like(mask)
+    inner[1:-1, 1:-1] = (
+        mask[1:-1, 1:-1]
+        & mask[:-2, 1:-1]
+        & mask[2:, 1:-1]
+        & mask[1:-1, :-2]
+        & mask[1:-1, 2:]
+    )
+    return mask & ~inner
+
+
+def class_mask(cls: int, h: int, w: int) -> np.ndarray:
+    """Boolean silhouette of class ``cls`` inside an ``h x w`` box.
+
+    Distinct shapes matter: a detector that only learns "rectangle" cannot tell
+    the classes apart, and segmentation would collapse to a single foreground.
+    """
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    if cls == 0:  # block: the full box
+        return np.ones((h, w), dtype=bool)
+
+    if cls == 1:  # sphere: ellipse inscribed in the box
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+        rx, ry = max(w / 2.0, 1e-6), max(h / 2.0, 1e-6)
+        return ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0
+
+    # triangle: apex at top-centre, base across the bottom
+    half_width = np.linspace(0.0, w / 2.0, h)
+    return np.abs(xx - (w - 1) / 2.0) <= half_width[:, None]
+
 
 
 def generate_synthetic_dataset(
@@ -116,6 +165,7 @@ def generate_synthetic_dataset(
 
         specs = []
         for d in obj_depth:
+            cls = int(rng.integers(0, NUM_CLASSES))
             # Nearer objects are larger, but with enough per-axis noise that
             # area alone does not determine depth.
             scale = (1.10 - 0.70 * float(d)) * rng.uniform(0.85, 1.15, size=2)
@@ -123,20 +173,24 @@ def generate_synthetic_dataset(
             h = int(np.clip(12 * scale[1] * 1.6, 8, IMG_SIZE // 2))
             x = int(rng.integers(0, IMG_SIZE - w + 1))
             y = int(rng.integers(0, IMG_SIZE - h + 1))
-            specs.append((float(d), x, y, w, h))
+            specs.append((cls, float(d), x, y, w, h))
 
         # Paint farthest first so nearer objects occlude them.
-        for d, x, y, w, h in sorted(specs, key=lambda s: -s[0]):
-            # Exclusive upper bound -> the rectangle is exactly w x h pixels,
-            # which is what the box label claims.
-            rgb[y : y + h, x : x + w] = _object_color(rng, d)
-            seg[y : y + h, x : x + w] = 1
-            depth[y : y + h, x : x + w] = d
+        for cls, d, x, y, w, h in sorted(specs, key=lambda s: -s[1]):
+            color = _object_color(rng, d, cls)
+            mask = class_mask(cls, h, w)
+            # Exclusive upper bound -> the box is exactly w x h pixels, which is
+            # what the amodal box label claims. The silhouette is the mask.
+            patch = rgb[y : y + h, x : x + w]
+            patch[mask] = color
+            patch[_mask_boundary(mask)] = (np.array(color) * 0.55).astype(np.uint8)
+            seg[y : y + h, x : x + w][mask] = cls + 1
+            depth[y : y + h, x : x + w][mask] = d
 
-        for d, x, y, w, h in specs:
+        for cls, d, x, y, w, h in specs:
             boxes.append(
                 {
-                    "cls": 0,
+                    "cls": cls,
                     "xc": (x + w / 2) / IMG_SIZE,
                     "yc": (y + h / 2) / IMG_SIZE,
                     "w": w / IMG_SIZE,

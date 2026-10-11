@@ -11,11 +11,13 @@ import pytest
 import torch
 from PIL import Image
 
+from per_camera.classes import NUM_CLASSES, NUM_SEG_CLASSES
 from per_camera.data import (
     BG_DEPTH_NEAR,
     MAX_BOXES_PER_FRAME,
     PerCameraDataset,
     build_transform,
+    class_mask,
     collate_fn,
     generate_synthetic_dataset,
     pad_boxes,
@@ -70,7 +72,7 @@ def test_dataset_shapes_and_keys(manifest):
     ann = sample["ann"]
     assert ann["boxes"].shape == (MAX_BOXES_PER_FRAME, 5)
     assert ann["box_mask"].shape == (MAX_BOXES_PER_FRAME,)
-    assert ann["heatmap"].shape[0] == 1
+    assert ann["heatmap"].shape[0] == NUM_CLASSES
     assert ann["reg_index"].dtype == torch.int64
 
 
@@ -117,17 +119,29 @@ def test_generator_produces_empty_frames(manifest):
     assert max(counts) <= MAX_BOXES_PER_FRAME
 
 
-def test_mask_matches_the_box_label_exactly(manifest):
-    """Regression: PIL's inclusive rectangle painted (w+1)x(h+1) while the box
-    label claimed w x h, so segmentation and detection GT disagreed."""
+def test_mask_stays_inside_the_box_label(manifest):
+    """The segmentation silhouette must be contained in the amodal box.
+
+    Regression: PIL's inclusive rectangle painted (w+1)x(h+1) while the box
+    label claimed w x h, so segmentation and detection GT disagreed. Now that
+    each class has its own silhouette the box is an outer bound rather than an
+    exact match, but it still must not leak.
+    """
     for row in _rows(manifest):
         boxes = json.loads(row["boxes"])
         if len(boxes) != 1:
             continue  # occlusion makes the union non-additive
         seg = np.array(Image.open(manifest.parent / row["seg"]))
         box = boxes[0]
-        expected = round(box["w"] * IMG_SIZE) * round(box["h"] * IMG_SIZE)
-        assert int(seg.sum()) == expected, f"{int(seg.sum())} != {expected}"
+        w = round(box["w"] * IMG_SIZE)
+        h = round(box["h"] * IMG_SIZE)
+        x = int(round(box["xc"] * IMG_SIZE - w / 2))
+        y = int(round(box["yc"] * IMG_SIZE - h / 2))
+
+        inside = np.zeros_like(seg, dtype=bool)
+        inside[y : y + h, x : x + w] = True
+        assert (seg > 0).sum() > 0, "object produced no mask at all"
+        assert not (seg[~inside] > 0).any(), "mask leaked outside its box label"
 
 
 def test_depth_is_a_real_field_not_a_mask_copy(manifest):
@@ -161,7 +175,7 @@ def test_labels_are_in_valid_ranges(manifest):
         for box in json.loads(row["boxes"]):
             for field in ("xc", "yc", "w", "h", "depth"):
                 assert 0.0 <= box[field] <= 1.0
-            assert box["cls"] == 0
+            assert 0 <= box["cls"] < NUM_CLASSES
 
 
 def test_parse_boxes_handles_empty():
@@ -197,3 +211,49 @@ def test_missing_manifest_raises(tmp_path):
 def test_max_samples_must_be_positive(manifest):
     with pytest.raises(ValueError):
         PerCameraDataset(manifest, max_samples=0)
+
+
+def test_all_three_classes_are_actually_generated(tmp_path):
+    """Regression: the head supported N classes but the generator only ever
+    emitted class 0, so multi-class support was untested and unusable."""
+    manifest = generate_synthetic_dataset(
+        80, data_dir=tmp_path / "d", manifest_path=tmp_path / "m.csv", seed=7
+    )
+    seen: set[int] = set()
+    for row in _rows(manifest):
+        for box in json.loads(row["boxes"]):
+            seen.add(int(box["cls"]))
+
+    assert seen == set(range(NUM_CLASSES)), f"only generated classes {sorted(seen)}"
+
+
+def test_segmentation_labels_cover_every_class(tmp_path):
+    manifest = generate_synthetic_dataset(
+        80, data_dir=tmp_path / "d", manifest_path=tmp_path / "m.csv", seed=7
+    )
+    values: set[int] = set()
+    for row in _rows(manifest):
+        values |= set(np.unique(np.array(Image.open(manifest.parent / row["seg"]))).tolist())
+
+    assert 0 in values, "background must be present"
+    assert max(values) <= NUM_SEG_CLASSES - 1, f"label {max(values)} out of range"
+    # 0..NUM_CLASSES: background plus every object class.
+    assert values == set(range(NUM_SEG_CLASSES)), f"missing labels: {sorted(values)}"
+
+
+def test_each_class_has_a_distinct_silhouette():
+    """If the shapes coincided, the classes would be indistinguishable and
+    per-class AP would be meaningless."""
+    masks = [class_mask(c, 32, 32) for c in range(NUM_CLASSES)]
+
+    for i in range(NUM_CLASSES):
+        for j in range(i + 1, NUM_CLASSES):
+            assert not np.array_equal(masks[i], masks[j]), f"{i} and {j} are identical"
+            inter = (masks[i] & masks[j]).sum()
+            union = (masks[i] | masks[j]).sum()
+            assert inter / union < 0.9, f"classes {i} and {j} are near-identical"
+
+    # A block fills its box; the others are strict subsets.
+    assert masks[0].all()
+    assert not masks[1].all()
+    assert not masks[2].all()

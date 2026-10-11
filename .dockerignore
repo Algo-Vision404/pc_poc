@@ -1,0 +1,26 @@
+.git
+.github
+.gitignore
+
+# Generated data and weights — mounted as a volume at runtime, never baked in.
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+ui/node_modules/
+ui/dist/
+
+# Docs and tests are not needed in the runtime image.
+AUDIT.md
+tests/
+.dockerignore
+Dockerfile
+docker-compose.yml

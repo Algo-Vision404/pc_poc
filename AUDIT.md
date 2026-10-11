@@ -25,6 +25,51 @@ to git do not correspond to the code committed to git.
 
 ---
 
+## Resolution ledger
+
+Written after the fact, as the fixes landed. Findings below keep their original
+wording — this table is the current state.
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | Checkpoint cannot be loaded by the shipped code | **Fixed** — `ARCH_VERSION` is stored in and asserted against every checkpoint |
+| 2 | Training script always exits 1 | **Fixed** |
+| 3 | ONNX export fails out of the box | **Fixed** — export runs in the training run |
+| 4 | `ARTIFACTS` is CWD-relative | **Fixed** — repo-anchored, overridable via `PC_POC_ARTIFACTS` |
+| 5 | `requirements.txt` missing API deps | **Fixed** — pinned, plus `requirements-export.txt` |
+| 6 | Committed manifest has Windows paths | **Fixed** — paths are manifest-relative; Windows paths detected explicitly |
+| 7 | "Best" checkpoint compares train loss to `best_val_loss` | **Fixed** — selects on validation score |
+| 8 | Ordinary CLI arguments crash the trainer | **Fixed** |
+| 9 | No seeding anywhere | **Fixed** — `--seed`; verified byte-identical reruns |
+| 10 | GT labels internally inconsistent | **Fixed** — mask is the class silhouette inside the amodal box |
+| 11 | "Depth" is not depth | **Fixed** — receding background plane, per-object depth, haze cue |
+| 12 | `mIoU` misnamed, unguarded 0/0 | **Fixed** — per-class with `None` for absent classes |
+| 13 | No detection task, constant class label | **Fixed** — CenterNet head; now **multi-class** (3 classes, class-aware mAP) |
+| 14 | API returns 500 on malformed input | **Fixed** — magic-byte sniff, 400/413/422 |
+| 15 | Boxes never mapped back to the input | **Fixed** — letterbox inverse |
+| 16 | Overlay wrong for non-square images | **Fixed** |
+| 17 | CORS `*` with credentials | **Fixed** — allowlist |
+| 18 | Blocking inference in `async def` | **Fixed** — sync `def`, runs in a threadpool |
+| 19 | No upload size / bomb guard | **Fixed** — 10 MB and 16 MP caps |
+| 20 | 8 npm vulnerabilities, lint red | **Fixed** — `npm audit` reports 0; lint clean |
+| 21 | Backend URL hardcoded | **Fixed** — `VITE_API_URL` + dev proxy; dead assets removed |
+| 22 | 38 MB of artifacts committed | **Fixed** — 1567 tracked files down to 41 |
+| 23 | No tests, no CI, no licence, no packaging | **Fixed** — 84 tests, GitHub Actions, MIT, `pyproject.toml` |
+| 24 | Checkpoints carry no metadata | **Fixed** |
+| 25 | `train and vis/` directory | **Fixed** — package layout |
+| 26 | Module-level side effects | **Fixed** |
+| 27 | `inference_poc.py` overwrites the dataset | **Fixed defensively** — writes `RESULTS_DIR/demo_frames`. The clobbering was **[unverified]**; the fix is precautionary. |
+| 28 | Performance table backed by nothing | **Fixed** — regenerated from `poc_results.json` |
+| 29 | README diagram contradicts code | **Fixed** |
+| 30 | Dead code and template cruft | **Fixed** |
+| 31 | Frontend robustness gaps | **Fixed** — abort + in-flight guard, error state replaces `alert()`, real webcam constraints |
+| 32 | Miscellaneous | **Fixed** |
+
+Still open: the Docker files are committed but were **never built** — Docker is
+unavailable in the environment where they were written.
+
+---
+
 ## P0 — Blocking: nothing runs
 
 ### 1. The shipped checkpoint cannot be loaded by the shipped code

@@ -57,7 +57,7 @@ def _gt(xc, yc, w, h, cls=0):
 def test_ap_is_one_for_a_perfect_detector():
     dets = [np.array([_det(0.5, 0.5, 0.2, 0.2, 0.9)])]
     gts = [np.array([_gt(0.5, 0.5, 0.2, 0.2)])]
-    ap, recall, precision = average_precision(dets, gts)
+    ap, recall, precision, _ = average_precision(dets, gts)
     assert ap == pytest.approx(1.0)
     assert recall == pytest.approx(1.0)
     assert precision == pytest.approx(1.0)
@@ -65,21 +65,21 @@ def test_ap_is_one_for_a_perfect_detector():
 
 def test_ap_is_zero_when_nothing_is_detected():
     gts = [np.array([_gt(0.5, 0.5, 0.2, 0.2)])]
-    ap, recall, _ = average_precision([np.zeros((0, 6))], gts)
+    ap, recall, _, _ = average_precision([np.zeros((0, 6))], gts)
     assert ap == 0.0
     assert recall == 0.0
 
 
 def test_ap_is_zero_when_there_is_nothing_to_detect_but_we_fire_anyway():
     dets = [np.array([_det(0.5, 0.5, 0.2, 0.2, 0.9)])]
-    ap, _, _ = average_precision(dets, [np.zeros((0, 5))])
+    ap, _, _, _ = average_precision(dets, [np.zeros((0, 5))])
     assert ap == 0.0
 
 
 def test_ap_is_zero_for_a_misplaced_detection():
     dets = [np.array([_det(0.1, 0.1, 0.1, 0.1, 0.9)])]
     gts = [np.array([_gt(0.9, 0.9, 0.1, 0.1)])]
-    ap, recall, _ = average_precision(dets, gts)
+    ap, recall, _, _ = average_precision(dets, gts)
     assert ap == 0.0
     assert recall == 0.0
 
@@ -93,7 +93,7 @@ def test_ap_penalises_a_false_positive_ranked_above_the_true_one():
             [_det(0.05, 0.05, 0.05, 0.05, 0.95), _det(0.5, 0.5, 0.2, 0.2, 0.9)]
         )
     ]
-    ap, recall, precision = average_precision(dets, gts)
+    ap, recall, precision, _ = average_precision(dets, gts)
     assert recall == pytest.approx(1.0)
     assert precision == pytest.approx(0.5)
     assert ap == pytest.approx(0.5)
@@ -106,7 +106,7 @@ def test_a_low_ranked_false_positive_leaves_ap_unchanged():
             [_det(0.5, 0.5, 0.2, 0.2, 0.9), _det(0.05, 0.05, 0.05, 0.05, 0.8)]
         )
     ]
-    ap, _, precision = average_precision(dets, gts)
+    ap, _, precision, _ = average_precision(dets, gts)
     assert ap == pytest.approx(1.0)
     assert precision == pytest.approx(0.5), "the FP must still show up in precision"
 
@@ -119,7 +119,7 @@ def test_ap_does_not_double_count_a_matched_ground_truth():
             [_det(0.5, 0.5, 0.2, 0.2, 0.9), _det(0.5, 0.5, 0.2, 0.2, 0.8)]
         )
     ]
-    _, recall, precision = average_precision(dets, gts)
+    _, recall, precision, _ = average_precision(dets, gts)
     assert recall == pytest.approx(1.0)
     assert precision == pytest.approx(0.5)
 
@@ -129,7 +129,7 @@ def test_ap_counts_multiple_objects_per_frame():
     dets = [
         np.array([_det(0.25, 0.25, 0.2, 0.2, 0.9), _det(0.75, 0.75, 0.2, 0.2, 0.85)])
     ]
-    ap, recall, precision = average_precision(dets, gts)
+    ap, recall, precision, _ = average_precision(dets, gts)
     assert recall == pytest.approx(1.0)
     assert precision == pytest.approx(1.0)
     assert ap == pytest.approx(1.0)

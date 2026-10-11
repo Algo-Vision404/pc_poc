@@ -5,6 +5,10 @@ import './index.css';
 // host in every real deployment. Falls back to the Vite dev proxy.
 const API_URL = import.meta.env.VITE_API_URL ?? '/api';
 
+// Mirrors SEG_PALETTE in per_camera/classes.py so a box and its segmentation
+// mask are the same colour. Indexed by class_id.
+const CLASS_COLORS = ['#ef4444', '#22c55e', '#3b82f6'];
+
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -12,12 +16,20 @@ function App() {
   const [results, setResults] = useState(null);
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.5);
   
+  // Surfaced in the UI instead of an alert(), and cleared on the next success.
+  const [error, setError] = useState(null);
+
   // Webcam & Stream references
   const videoRef = useRef(null);
   const streamCanvasRef = useRef(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWebcamActive, setIsWebcamActive] = useState(false);
   const streamIntervalRef = useRef(null);
+  // Cancels the previous request when a newer frame arrives.
+  const abortRef = useRef(null);
+  // True while a stream request is in flight, so slow frames get dropped
+  // rather than queued.
+  const inFlightRef = useRef(false);
 
   // Generate synthetic frame on a canvas
   const createSyntheticFrame = (canvas) => {
@@ -69,29 +81,33 @@ function App() {
     }
   };
 
-  const performPrediction = async (fileToPredict) => {
+  const performPrediction = async (fileToPredict, signal) => {
     const formData = new FormData();
     formData.append('file', fileToPredict);
-    try {
-      const res = await fetch(`${API_URL}/predict`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) throw new Error(`Prediction failed: ${res.status}`);
-      return await res.json();
-    } catch (err) {
-      console.error(err);
-      return null;
+    const res = await fetch(`${API_URL}/predict`, { method: 'POST', body: formData, signal });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        detail = (await res.json()).detail ?? '';
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(detail || `Backend returned ${res.status}`);
     }
+    return res.json();
   };
 
   const handlePredict = async () => {
     if (!selectedFile) return;
     setLoading(true);
-    const data = await performPrediction(selectedFile);
-    if (data) setResults(data);
-    else alert('Error connecting to backend.');
-    setLoading(false);
+    setError(null);
+    try {
+      setResults(await performPrediction(selectedFile));
+    } catch (err) {
+      if (err.name !== 'AbortError') setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Live Stream Logic
@@ -101,14 +117,30 @@ function App() {
     } else {
       stopAllStreams();
       setIsStreaming(true);
-      streamIntervalRef.current = setInterval(async () => {
+      setError(null);
+      streamIntervalRef.current = setInterval(() => {
+        // Drop the tick instead of queueing it. Without this guard a slow
+        // backend makes requests pile up and they resolve out of order, so a
+        // stale frame can overwrite a newer one on screen.
+        if (inFlightRef.current) return;
+        inFlightRef.current = true;
+
         const canvas = document.createElement('canvas');
         createSyntheticFrame(canvas);
         setPreview(canvas.toDataURL('image/png'));
         canvas.toBlob(async (blob) => {
-          const file = new File([blob], 'stream.png', { type: 'image/png' });
-          const data = await performPrediction(file);
-          if (data) setResults(data);
+          abortRef.current?.abort();
+          const controller = new AbortController();
+          abortRef.current = controller;
+          try {
+            const file = new File([blob], 'stream.png', { type: 'image/png' });
+            setResults(await performPrediction(file, controller.signal));
+            setError(null);
+          } catch (err) {
+            if (err.name !== 'AbortError') setError(err.message);
+          } finally {
+            inFlightRef.current = false;
+          }
         });
       }, 500); // 2 FPS
     }
@@ -118,41 +150,77 @@ function App() {
   const toggleWebcam = async () => {
     if (isWebcamActive) {
       stopAllStreams();
-    } else {
-      stopAllStreams();
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 128, height: 128 } });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          setIsWebcamActive(true);
-          
-          streamIntervalRef.current = setInterval(() => {
-            if (!videoRef.current || !streamCanvasRef.current) return;
-            const canvas = streamCanvasRef.current;
-            const ctx = canvas.getContext('2d');
-            canvas.width = 128;
-            canvas.height = 128;
-            ctx.drawImage(videoRef.current, 0, 0, 128, 128);
-            
-            setPreview(canvas.toDataURL('image/png'));
-            canvas.toBlob(async (blob) => {
-              const file = new File([blob], 'webcam.png', { type: 'image/png' });
-              const data = await performPrediction(file);
-              if (data) setResults(data);
-            });
-          }, 1000); // 1 FPS
-        }
-      } catch (err) {
-        console.error("Webcam error:", err);
-        alert("Webcam access denied or unavailable.");
-      }
+      return;
+    }
+    stopAllStreams();
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('Webcam capture needs a secure context (https or localhost).');
+      return;
+    }
+
+    try {
+      // Width/height here are ideals, not guarantees — real cameras return
+      // their native resolution, so the capture canvas follows whatever the
+      // track actually delivers instead of assuming 128x128.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      if (!videoRef.current) return;
+
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play().catch(() => undefined);
+      setIsWebcamActive(true);
+      setError(null);
+
+      streamIntervalRef.current = setInterval(() => {
+        const video = videoRef.current;
+        const canvas = streamCanvasRef.current;
+        if (!video || !canvas || video.readyState < 2 || inFlightRef.current) return;
+
+        // Keep the sensor's aspect ratio; the backend letterboxes to square.
+        const scale = Math.min(1, 512 / Math.max(video.videoWidth, 1));
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        setPreview(canvas.toDataURL('image/png'));
+        inFlightRef.current = true;
+        canvas.toBlob(async (blob) => {
+          abortRef.current?.abort();
+          const controller = new AbortController();
+          abortRef.current = controller;
+          try {
+            const file = new File([blob], 'webcam.png', { type: 'image/png' });
+            setResults(await performPrediction(file, controller.signal));
+            setError(null);
+          } catch (err) {
+            if (err.name !== 'AbortError') setError(err.message);
+          } finally {
+            inFlightRef.current = false;
+          }
+        });
+      }, 1000); // 1 FPS
+    } catch (err) {
+      console.error('Webcam error:', err);
+      setError(
+        err?.name === 'NotAllowedError'
+          ? 'Camera permission denied.'
+          : 'Camera unavailable on this device.'
+      );
     }
   };
 
   const stopAllStreams = () => {
     if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
-    if (videoRef.current && videoRef.current.srcObject) {
-      videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+    streamIntervalRef.current = null;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    inFlightRef.current = false;
+    if (videoRef.current?.srcObject) {
+      videoRef.current.srcObject.getTracks().forEach((track) => track.stop());
+      // Leave the camera light off in the UI, not just stopped underneath.
+      videoRef.current.srcObject = null;
     }
     setIsStreaming(false);
     setIsWebcamActive(false);
@@ -223,6 +291,14 @@ function App() {
             )}
           </div>
 
+          {/* Backend / camera errors. Outside the results block so it still
+              shows on the first failed request, when there is nothing to render. */}
+          {error && (
+            <div className="error-banner glass-panel" role="alert">
+              <strong>Error:</strong> {error}
+            </div>
+          )}
+
           {/* Results */}
           {results && (
             <div className="results-panel glass-panel slide-up">
@@ -247,24 +323,38 @@ function App() {
                   <h3>Input + Detection</h3>
                   <div style={{position: 'relative', width: '100%'}}>
                     <img src={preview || `data:image/png;base64,${results.input_b64}`} alt="Detection" />
-                    {visibleDetections.map((det, i) => (
-                      <div
-                        key={i}
-                        style={{
-                          position: 'absolute',
-                          left: `${det.x * 100}%`,
-                          top: `${det.y * 100}%`,
-                          width: `${det.w * 100}%`,
-                          height: `${det.h * 100}%`,
-                          border: '2px solid red',
-                          pointerEvents: 'none'
-                        }}
-                      >
-                        <span style={{color:'red', fontSize:'10px', position:'absolute', top:'-15px', left:'-2px'}}>
-                          {det.score.toFixed(2)}
-                        </span>
-                      </div>
-                    ))}
+                    {visibleDetections.map((det, i) => {
+                      const color = CLASS_COLORS[det.class_id] ?? '#ef4444';
+                      return (
+                        <div
+                          key={i}
+                          style={{
+                            position: 'absolute',
+                            left: `${det.x * 100}%`,
+                            top: `${det.y * 100}%`,
+                            width: `${det.w * 100}%`,
+                            height: `${det.h * 100}%`,
+                            border: `2px solid ${color}`,
+                            pointerEvents: 'none'
+                          }}
+                        >
+                          <span
+                            style={{
+                              color: '#fff',
+                              background: color,
+                              fontSize: '10px',
+                              padding: '0 3px',
+                              position: 'absolute',
+                              top: '-15px',
+                              left: '-2px',
+                              whiteSpace: 'nowrap'
+                            }}
+                          >
+                            {det.class ?? 'object'} {det.score.toFixed(2)}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
                 <div className="grid-item">

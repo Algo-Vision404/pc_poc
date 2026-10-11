@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .classes import SEG_PALETTE
 from .data import PerCameraDataset, build_transform, generate_synthetic_dataset
 from .detection import decode_detections
 from .model import BigPerCameraNet
@@ -28,6 +29,16 @@ SCORE_THRESHOLD = 0.2
 def unnormalize(tensor: torch.Tensor) -> torch.Tensor:
     """Undo the (0.5, 0.5, 0.5) normalisation back to [0, 1]."""
     return tensor * 0.5 + 0.5
+
+
+def _seg_to_bgr(seg: np.ndarray) -> np.ndarray:
+    """Map class indices to distinct BGR colours using the shared palette.
+
+    Scaling the label image by 255 instead would clip every class above 0 to
+    the same saturated colour, so a four-class mask looked single-colour.
+    """
+    lut = np.array(SEG_PALETTE, dtype=np.uint8)[:, ::-1]  # RGB -> BGR
+    return lut[np.clip(seg, 0, len(lut) - 1).astype(int)]
 
 
 def _label(image: np.ndarray, text: str, x: int, y: int) -> None:
@@ -101,18 +112,13 @@ def run_inference_video(
                 (np.clip(pred_depth, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS
             )
 
-            gt_seg_color = cv2.cvtColor((gt_seg * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-            gt_seg_color[:, :, 0] = 0
-            gt_seg_color[:, :, 2] = 0
-
-            pred_seg_color = cv2.cvtColor((pred_seg * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-            pred_seg_color[:, :, 0] = 0
-            pred_seg_color[:, :, 1] = 0
+            gt_seg_color = _seg_to_bgr(gt_seg)
+            pred_seg_color = _seg_to_bgr(pred_seg)
 
             grid = np.vstack(
                 (np.hstack((disp, depth_color)), np.hstack((gt_seg_color, pred_seg_color)))
             )
-            _label(grid, "Input + GT(green)/Pred(red)", 5, 15)
+            _label(grid, "Input + depth / GT seg + Pred seg", 5, 15)
             _label(grid, "Depth Map", IMG_SIZE + 5, 15)
             _label(grid, "GT Segmentation", 5, IMG_SIZE + 15)
             _label(grid, "Pred Segmentation", IMG_SIZE + 5, IMG_SIZE + 15)
