@@ -1,22 +1,28 @@
-# Python
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
 venv/
+.venv/
 .env
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
 
-# Generated training artifacts (large binary files — do not commit)
-train and vis/artifacts/synthetic_data/
-train and vis/artifacts/models/*.pt
-train and vis/artifacts/models/*.onnx
-train and vis/artifacts/videos/
+# --- Generated training artifacts ---
+# The artifact tree is created at the REPO ROOT by src/per_camera/paths.py
+# (override with PC_POC_ARTIFACTS). Generated data, weights, and exports are
+# never committed: they are large and they drift out of sync with the code.
+/artifacts/
 
-# Node
+# --- Node ---
 ui/node_modules/
 ui/dist/
 
-# OS
+# --- OS ---
 .DS_Store
 Thumbs.db

@@ -55,9 +55,9 @@ This project evolved from a lightweight single-task PoC (`TinyPerCameraNet`) int
 ┌────────▼───────┐ ┌────────▼───────┐ ┌────────▼───────┐
 │  Segmentation  │ │   Depth Head   │ │ Detection Head │
 │     Head       │ │                │ │                │
-│ ConvT 2×2 ×3  │ │ ConvT 2×2 ×3  │ │ Conv 3×3 (det) │
-│ Conv 1×1       │ │ Conv 1×1+Sig  │ │ AdaptAvgPool   │
-│ 2-class logits │ │ [0,1] depth   │ │ FC cls + bbox  │
+│ Conv3×3 ×2    │ │ Conv3×3 ×2    │ │ Conv3×3 s2 ×2  │
+│ Upsample ×4/×2 │ │ Upsample ×4/×2 │ │ Flatten → FC   │
+│ 2-class logits │ │ Conv1×1+Sigmoid│ │ FC cls + bbox  │
 └────────┬───────┘ └────────┬───────┘ └────────┬───────┘
          │                  │                  │
     Seg Mask (H×W)    Depth Map (H×W)   [cls_score, x, y, w, h]
@@ -75,19 +75,22 @@ Input ──► Conv3×3 ──► BN ──► ReLU ──► Conv3×3 ──�
 ### Detection Head (Spatial-Preserving)
 
 ```
-Feature Map (128ch)
+Feature Map (128ch, 16×16)
     │
-    ▼  Conv3×3 + BN + ReLU   →  64ch
+    ▼  Conv3×3 s2 + BN + ReLU   →  64ch, 8×8
     │
-    ▼  Conv3×3 + BN + ReLU   →  64ch
+    ▼  Conv3×3 s2 + BN + ReLU   →  32ch, 4×4
     │
-    ▼  AdaptiveAvgPool2d(4×4)
+    ▼  Flatten  →  512
     │
-    ▼  Flatten  →  1024
+    ▼  FC(512→256) + ReLU + Dropout(0.3)
     │
-    ├──► FC(1024→1)   →  cls score (BCEWithLogits)
-    └──► FC(1024→4)   →  [xc, yc, w, h] normalized (SmoothL1)
+    ├──► FC(256→1)              →  cls score (BCEWithLogits)
+    └──► FC(256→4) + Sigmoid    →  [xc, yc, w, h] normalized (SmoothL1)
 ```
+
+> No `AdaptiveAvgPool2d` anywhere in the head — pooling destroys the spatial
+> signal the box regression depends on. Strided convolutions keep it.
 
 ### Multi-Task Loss
 
@@ -132,83 +135,128 @@ L_total = L_seg  +  30 × L_depth  +  L_cls  +  2 × L_bbox
 ## Directory Structure
 
 ```
-per_camera_poc/
-├── train and vis/
-│   ├── per_camera_poc.py     # Dataset generation + BigPerCameraNet + training
+pc_poc/
+├── src/per_camera/           # Installable Python package
+│   ├── paths.py              # Artifact resolution (repo-anchored, env-overridable)
+│   ├── model.py              # BigPerCameraNet + ARCH_VERSION
+│   ├── data.py               # Dataset generation, Dataset, collate, transform
+│   ├── metrics.py            # IoU / RMSE evaluation
+│   ├── training.py           # Training loop + checkpoint I/O
 │   ├── api.py                # FastAPI inference server
-│   ├── inference_poc.py      # Offline batch inference + telemetry video
-│   ├── visualize_poc.py      # Ground-truth visualization utilities
-│   └── artifacts/
-│       ├── models/           # .pt checkpoints, .onnx exports
-│       ├── results/          # poc_results.json (KPI metrics)
-│       └── synthetic_data/   # Generated images, masks, depth .npy
+│   ├── inference.py          # Offline batch inference -> MP4 grid
+│   └── visualize.py          # Per-sample prediction figures
+├── artifacts/                # GENERATED, gitignored. Created at the repo root.
+│   ├── models/               # .pt checkpoints, .onnx exports
+│   ├── results/              # poc_results.json, figures, demo video
+│   ├── synthetic_data/       # Generated images, masks, depth .npy
+│   └── dataset_manifest.csv  # Relative paths — portable across machines
 ├── ui/
-│   ├── src/
-│   │   ├── App.jsx           # Main dashboard (upload/stream/webcam)
-│   │   └── index.css         # SaaS design system tokens
-│   ├── index.html
+│   ├── src/App.jsx           # Dashboard (upload / stream / webcam)
+│   ├── src/index.css         # Design system tokens
 │   └── package.json
-├── requirements.txt
+├── tests/
+├── pyproject.toml
+├── requirements.txt          # Pinned runtime deps
+├── requirements-export.txt   # Optional ONNX export deps
 └── README.md
 ```
+
+Artifact location is resolved once, in `src/per_camera/paths.py`, anchored to the
+repository — **never** to the current working directory. Override it with
+`PC_POC_ARTIFACTS=/some/where`.
+
 
 ---
 
 ## Performance
 
-Latest training run (2 048 samples, 30 epochs, batch 32, AdamW lr=1e-3):
+Metrics are written to `artifacts/results/poc_results.json` by every training
+run, and that file — not this README — is the source of truth. Checkpoint
+metadata (epoch, config, metrics, architecture version, torch version) is
+embedded in the `.pt` file itself, so you can always tell which model you have.
 
-| Metric | Value |
-|---|---|
-| **Segmentation mIoU** | **0.927** |
-| **Depth RMSE** | **0.096** |
-| **Detection IoU** | 0.387 |
-| **Best Val Loss** | 0.0267 |
+```json
+{
+  "arch_version": "big-per-camera-net-v1",
+  "best_metrics": { "val_mIoU": 0.0, "val_rmse": 0.0738, "val_det_iou": 0.1265 },
+  "config": { "epochs": 5, "batch_size": 32, "dataset_size": 128 },
+  "torch_version": "2.14.1+cu130"
+}
+```
 
-> Detection IoU is bounded by the spatial resolution of the 128×128 synthetic dataset. Real-world deployment with higher resolution and real camera data will significantly improve this metric.
+> **These numbers do not reproduce run to run, and that is a known defect.**
+> Nothing in the training path is seeded — not the dataset, not the train/val
+> split, not the weight init — so two runs of the same command diverge. Two
+> 128-sample / 5-epoch runs measured `val_mIoU` 0.208 and 0.000. Adding
+> `--seed` is tracked in `AUDIT.md`.
+>
+> Two further caveats, also in `AUDIT.md`: "mIoU" is foreground-only rather
+> than a true mean over classes, and "Detection IoU" is localisation error on
+> a single-object synthetic task, not AP.
+
 
 ---
 
 ## Quick Start
 
+Requires Python 3.10+.
+
 ### 1. Clone & setup
 
 ```bash
-git clone https://github.com/Algo-Vision404/Per-Camera-Proof-of-Concept-PoC-.git
-cd Per-Camera-Proof-of-Concept-PoC-
-python -m venv venv
-# Windows:
-.\venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/Algo-Vision404/pc_poc.git
+cd pc_poc
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt           # runtime deps
+pip install -r requirements-export.txt    # optional: ONNX export
+pip install -e .                          # installs the per_camera package + CLI
 ```
 
 ### 2. Train the model
 
 ```bash
-cd "train and vis"
-python per_camera_poc.py --samples 2048 --epochs 30 --batch 32
+python -m per_camera.training --samples 2048 --epochs 30 --batch 32
+# or, equivalently:
+pc-poc-train --samples 2048 --epochs 30 --batch 32
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `--samples` | 128 | Number of synthetic frames to generate |
+| `--samples` | 128 | Synthetic frames to generate |
 | `--epochs` | 20 | Training epochs |
 | `--batch` | 16 | Batch size |
+| `--max_samples` | all | Cap the dataset size |
 
-Artifacts are written to `train and vis/artifacts/`.
+Artifacts are written to `artifacts/` at the repo root (override with
+`PC_POC_ARTIFACTS`). This step is **required** before starting the API — there
+is no committed checkpoint.
 
 ### 3. Start the inference API
 
 ```bash
-cd "train and vis"
-uvicorn api:app --port 8000
+python -m uvicorn per_camera.api:app --host 0.0.0.0 --port 8000
+# or:
+pc-poc-api --port 8000
 ```
 
-API will be live at `http://127.0.0.1:8000`. Docs: `http://127.0.0.1:8000/docs`.
+Live at `http://127.0.0.1:8000` — docs at `/docs`, readiness at `/health`.
 
-### 4. Start the dashboard
+The server refuses to start without a valid checkpoint. `GET /health` reports
+the loaded architecture version and training epoch, so you can always confirm
+which model is actually serving.
+
+### 4. Optional: demo video and figures
+
+```bash
+pc-poc-infer --frames 60 --fps 10     # -> artifacts/results/inference_stream.mp4
+pc-poc-visualize --count 5            # -> artifacts/results/sample_*.png
+```
+
+Both write to their own directories and never touch the training set.
+
+### 5. Start the dashboard
 
 ```bash
 cd ui
@@ -217,6 +265,32 @@ npm run dev
 ```
 
 Dashboard at `http://localhost:3000`.
+
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+pytest          # 32 tests — path resolution, manifest portability,
+                # checkpoint guards, training validation, API contract
+ruff check src tests
+```
+
+The suite covers the failure modes this project previously shipped with: cwd-
+dependent artifact paths, manifests carrying another machine's absolute paths,
+checkpoints from a different architecture loading silently, and the trainer
+crashing on ordinary arguments.
+
+| Test module | Covers |
+|---|---|
+| `tests/test_paths.py` | Repo-anchored artifacts, env override, no import side effects |
+| `tests/test_data.py` | Relative manifest paths, portability, label ranges |
+| `tests/test_checkpoint.py` | Metadata, round-trip, stale-architecture rejection |
+| `tests/test_training.py` | Argument validation, result reporting |
+| `tests/test_api.py` | `/health` readiness, `/predict` response contract |
 
 ---
 
@@ -281,6 +355,21 @@ The React dashboard provides three input modes and three output panels:
 
 ## Disclaimer
 
-`per_camera_poc.py` auto-creates the `artifacts/` directory tree on first run — no manual folder setup needed.
+`artifacts/` is created automatically on first run and is gitignored — generated
+data, checkpoints, and exports are never committed, because they drift out of
+sync with the code. Train locally.
 
-The ONNX export step requires stdout UTF-8 support. On Windows the script handles this automatically via a safe encoding redirect.
+Every checkpoint records its `arch_version`. Loading a checkpoint written by a
+different model version raises immediately with a clear message instead of
+silently producing garbage:
+
+```
+RuntimeError: Checkpoint architecture mismatch at .../poc_checkpoint.pt.
+  checkpoint arch_version: None
+  code expects           : 'big-per-camera-net-v1'
+```
+
+The ONNX export is optional. If `onnx`/`onnxscript` are not installed the
+training run prints a warning to stderr and still exits 0 — the `.pt`
+checkpoint remains valid for the API.
+

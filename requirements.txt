@@ -1,6 +1,18 @@
-matplotlib
-numpy
-Pillow
-torch
-torchvision
-opencv-python
+# Fully pinned, tested dependency set (Python 3.11, CPU wheels).
+# pyproject.toml carries the minimum bounds; this file is the reproducible lock.
+#
+# Install:            pip install -r requirements.txt
+# Install + ONNX:     pip install -r requirements.txt -r requirements-export.txt
+
+numpy==2.4.6
+Pillow==12.3.0
+torch==2.14.1
+torchvision==0.29.1
+opencv-python-headless==5.0.0.93
+matplotlib==3.11.2
+
+# Inference API. python-multipart is REQUIRED by FastAPI for UploadFile;
+# without it `uvicorn per_camera.api:app` fails at startup.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
