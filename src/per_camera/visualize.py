@@ -92,8 +92,12 @@ def render_samples(
         axes[0].imshow(disp_img)
         axes[0].set_title(f"Input ({len(gt_boxes)} GT / {len(dets)} pred)")
         axes[0].axis("off")
-        for box in gt_boxes:
-            _rect(axes[0], box, "g", label="GT" if box is gt_boxes[0] else None)
+        # Label the first box of each kind by index. `box is gt_boxes[0]` looks
+        # equivalent but is always False: indexing a numpy array returns a fresh
+        # view object, so the identity check never matches and the "GT" legend
+        # entry was silently never drawn.
+        for j, box in enumerate(gt_boxes):
+            _rect(axes[0], box, "g", label="GT" if j == 0 else None)
         for j, det in enumerate(dets):
             _rect(
                 axes[0],
@@ -102,7 +106,10 @@ def render_samples(
                 linestyle="--",
                 label=f"Pred {det[4]:.2f}" if j == 0 else None,
             )
-        axes[0].legend(fontsize=8)
+        # Only draw a legend when something was labelled, otherwise matplotlib
+        # warns "No artists with labels found" on every empty frame.
+        if axes[0].get_legend_handles_labels()[1]:
+            axes[0].legend(fontsize=8)
 
         # Distinct colour per class; "gray" would make 0..3 nearly identical.
         axes[1].imshow(gt_seg, cmap=_SEG_CMAP, vmin=0, vmax=len(SEG_PALETTE) - 1)

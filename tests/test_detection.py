@@ -153,3 +153,77 @@ def test_box_iou_known_values():
     assert box_iou(np.array([0, 0, 1, 1]), np.array([2, 2, 3, 3])) == 0.0
     half = box_iou(np.array([0, 0, 2, 1]), np.array([1, 0, 3, 1]))
     assert abs(half - 1 / 3) < 1e-6
+
+
+def _det(xc, yc, w, h, score, cls):
+    return np.array([xc, yc, w, h, score, cls], dtype=np.float64)
+
+
+def test_nms_drops_a_duplicate_class_at_the_same_location():
+    """Regression: the per-channel max-pool let one object win in two class
+    channels, so the API returned e.g. block 0.64 and triangle 0.21 on the same
+    box — and drew the weaker one over the correct one."""
+    from per_camera.detection import class_agnostic_nms
+
+    dets = np.array(
+        [
+            _det(0.77, 0.90, 0.17, 0.16, 0.64, 0),  # block, correct
+            _det(0.77, 0.90, 0.17, 0.16, 0.21, 2),  # triangle, same box
+        ]
+    )
+
+    kept = class_agnostic_nms(dets, iou_thresh=0.5)
+
+    assert len(kept) == 1
+    assert kept[0][5] == 0, "kept the weaker duplicate instead of the winner"
+    assert kept[0][4] == pytest.approx(0.64)
+
+
+def test_nms_keeps_two_distinct_objects():
+    from per_camera.detection import class_agnostic_nms
+
+    dets = np.array(
+        [
+            _det(0.2, 0.2, 0.1, 0.1, 0.9, 0),
+            _det(0.8, 0.8, 0.1, 0.1, 0.7, 1),
+        ]
+    )
+
+    assert len(class_agnostic_nms(dets, iou_thresh=0.5)) == 2
+
+
+def test_nms_returns_results_in_descending_score_order():
+    from per_camera.detection import class_agnostic_nms
+
+    dets = np.array(
+        [
+            _det(0.2, 0.2, 0.1, 0.1, 0.3, 0),
+            _det(0.5, 0.5, 0.1, 0.1, 0.9, 1),
+            _det(0.8, 0.8, 0.1, 0.1, 0.6, 2),
+        ]
+    )
+
+    scores = class_agnostic_nms(dets)[:, 4]
+
+    assert list(scores) == sorted(scores, reverse=True)
+
+
+def test_nms_handles_an_empty_input():
+    from per_camera.detection import class_agnostic_nms
+
+    assert len(class_agnostic_nms(np.zeros((0, 6)))) == 0
+
+
+def test_nms_is_class_agnostic():
+    """Two classes on the same box is the case being fixed; two of the SAME
+    class on the same box is the ordinary NMS case. Both must collapse."""
+    from per_camera.detection import class_agnostic_nms
+
+    same_class = np.array(
+        [
+            _det(0.5, 0.5, 0.2, 0.2, 0.8, 1),
+            _det(0.5, 0.5, 0.2, 0.2, 0.4, 1),
+        ]
+    )
+
+    assert len(class_agnostic_nms(same_class, iou_thresh=0.5)) == 1

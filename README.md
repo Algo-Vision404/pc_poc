@@ -340,11 +340,10 @@ unprivileged user; weights are **not** baked into the image, so you must run
 ```bash
 pip install -e ".[dev]"
 
-pytest          # 80 tests — path resolution, manifest portability and
-                # reproducibility, GT consistency, detection targets and
-                # decoding, metric correctness, checkpoint guards, and the
-                # API contract including its error paths
+pytest          # 126 tests, 97% statement coverage of src/per_camera
 ruff check src tests
+
+cd ui && npm test   # 34 more, covering the dashboard
 ```
 
 The suite covers the failure modes this project previously shipped with: cwd-
@@ -355,12 +354,30 @@ crashing on ordinary arguments, and malformed uploads returning 500.
 | Test module | Covers |
 |---|---|
 | `tests/test_paths.py` | Repo-anchored artifacts, env override, no import side effects |
-| `tests/test_data.py` | Relative manifest paths, seeding, GT/box agreement, depth realism |
-| `tests/test_detection.py` | Heatmap targets, NMS, decode round-trip, box maths |
-| `tests/test_metrics.py` | Per-class mIoU incl. the 0/0 case, AP against hand-computed values |
+| `tests/test_data.py` | Relative manifest paths, seeding, GT/box agreement, depth realism, all three classes generated |
+| `tests/test_detection.py` | Heatmap targets, NMS incl. class-agnostic suppression, decode round-trip, box maths |
+| `tests/test_metrics.py` | Per-class mIoU incl. the 0/0 case, class-aware mAP against hand-computed values |
 | `tests/test_checkpoint.py` | Metadata, round-trip, stale-architecture rejection |
-| `tests/test_training.py` | Argument validation, split seeding, val-based selection |
-| `tests/test_api.py` | `/health` readiness, response contract, 400/413/422 paths |
+| `tests/test_training.py` | Argument validation, split seeding, val-based selection, early stopping, the CLI end to end |
+| `tests/test_api.py` | `/health` readiness, response contract, 400/413/422 paths, letterbox round-trip |
+| `tests/test_onnx.py` | Export validity and that the exported graph carries the real class count |
+| `tests/test_inference.py` | Demo-video entry point, and that it leaves the training dataset untouched |
+| `tests/test_visualize.py` | Figure entry point, per-class colormap, clamped sample count |
+
+The two entry points that were previously at 0% coverage — `inference.py` and
+`visualize.py` — are now exercised for real, which is how the "GT" legend label
+bug was found: it had been attached with `box is gt_boxes[0]`, which is always
+False because numpy indexing returns a fresh view object.
+
+### Detection post-processing
+
+The heatmap NMS runs per class channel, so a single object can win in two
+channels at once and come back as two detections at the same location with
+different labels. `class_agnostic_nms` suppresses the weaker one before the
+response is built. Measured on 40 frames: 85 raw detections → 78, removing 7
+duplicates across 4 frames, and the exact per-frame class match went from
+36/40 to 40/40. Without it the server-rendered overlay drew the duplicate over
+the correct box, so a block could appear outlined in the triangle's colour.
 
 ---
 

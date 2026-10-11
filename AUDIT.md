@@ -68,6 +68,21 @@ wording — this table is the current state.
 Still open: the Docker files are committed but were **never built** — Docker is
 unavailable in the environment where they were written.
 
+### Found later, while writing the test suites
+
+These were not in the original audit. Each was found by exercising a path that
+nothing covered, which is the argument for the coverage work.
+
+| Finding | Status |
+|---|---|
+| The API and `inference.py` rendered segmentation through `mask * 255` + a colormap, so classes 1, 2 and 3 all clipped to the same saturated colour — a four-class mask came back single-coloured | **Fixed** — shared `SEG_PALETTE` lookup, with a regression test |
+| The demo stream drew one random rectangle while the model has three distinct silhouettes, feeding it a distribution it was never trained on | **Fixed** — the generator now mirrors `per_camera.data` |
+| `canvas.toBlob` can call back with `null`; the dashboard wrapped it straight into a `File` and posted the string `"null"`, surfacing as a confusing 400 | **Fixed** — explicit guard, and the in-flight flag is released in a `finally` |
+| `visualize.py` attached its "GT" legend label with `box is gt_boxes[0]`, which is always False because numpy indexing returns a fresh view object. The legend was never drawn and matplotlib warned on every figure | **Fixed** — index comparison, and `legend()` is skipped when nothing is labelled |
+| The heatmap NMS runs per class channel, so one object could return as two detections of different classes; the API then drew the weaker one over the correct box | **Fixed** — `class_agnostic_nms`; 7 duplicates removed across 4 frames, exact class match 36/40 → 40/40 |
+| `export_onnx` catches every exception and returns False, so a broken export printed one warning and training still exited 0 — the original P0-3 failure mode could return undetected | **Covered** — 6 tests pinning the exported graph to the real class count |
+| `inference.py` and `visualize.py` were at 0% coverage | **Covered** — both now at 96%+ |
+
 ---
 
 ## P0 — Blocking: nothing runs

@@ -160,6 +160,40 @@ def decode_detections(
     return out
 
 
+def class_agnostic_nms(dets: np.ndarray, iou_thresh: float = 0.5) -> np.ndarray:
+    """Suppress lower-scoring detections that overlap a higher-scoring one.
+
+    ``nms_max_pool`` runs per class channel, so a single object can win in two
+    channels at once and come back as two detections at the same location with
+    different labels. On a three-class dataset where every object is
+    unambiguously one shape, the weaker one is always wrong — and because the
+    API draws boxes in class colours, it overdraws the correct box.
+
+    ``dets`` is ``(N, 6)`` of ``[xc, yc, w, h, score, cls]``. Returns the kept
+    rows, highest score first.
+    """
+    if len(dets) == 0:
+        return dets
+
+    order = np.argsort(-dets[:, 4])
+    dets = dets[order]
+    boxes = boxes_xywhn_to_xyxy(dets[:, :4].astype(np.float64))
+
+    keep: list[int] = []
+    suppressed = np.zeros(len(dets), dtype=bool)
+    for i in range(len(dets)):
+        if suppressed[i]:
+            continue
+        keep.append(i)
+        for j in range(i + 1, len(dets)):
+            if suppressed[j]:
+                continue
+            if box_iou(boxes[i], boxes[j]) >= iou_thresh:
+                suppressed[j] = True
+
+    return dets[keep]
+
+
 def focal_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """CenterNet's modified focal loss for the heatmap."""
     pred = torch.sigmoid(pred).clamp(1e-4, 1 - 1e-4)

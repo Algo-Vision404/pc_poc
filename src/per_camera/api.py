@@ -24,7 +24,7 @@ from PIL import Image, UnidentifiedImageError
 
 from .classes import CLASS_NAMES, SEG_PALETTE, class_name
 from .data import build_transform
-from .detection import decode_detections
+from .detection import class_agnostic_nms, decode_detections
 from .model import ARCH_VERSION, BigPerCameraNet
 from .paths import CHECKPOINT_PATH, IMG_SIZE
 from .training import load_checkpoint
@@ -207,7 +207,11 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
             out["heatmap"], out["offset"], out["size"], topk=MAX_DETECTIONS
         )[0].cpu().numpy()
 
-    kept = dets[dets[:, 4] >= SCORE_THRESHOLD]
+    # Class-agnostic NMS after thresholding: the per-channel max-pool in the
+    # decoder can put two classes on one object, and the weaker one is always
+    # wrong. Suppressing it keeps the response — and the drawn overlay — to one
+    # box per object.
+    kept = class_agnostic_nms(dets[dets[:, 4] >= SCORE_THRESHOLD])
     detections = []
     for xc, yc, w, h, score, cls in kept:
         x, y, bw, bh = box_to_original(
@@ -238,14 +242,18 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
         y1 = int(det["y"] * orig_h * scale) + pad_y
         x2 = int((det["x"] + det["w"]) * orig_w * scale) + pad_x
         y2 = int((det["y"] + det["h"]) * orig_h * scale) + pad_y
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        # Same per-class colour as the segmentation mask and the dashboard, so
+        # a box and the pixels inside it read as one object. Index +1 skips the
+        # background entry in the palette.
+        bgr = tuple(int(c) for c in reversed(SEG_PALETTE[det["class_id"] + 1]))
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), bgr, 2)
         cv2.putText(
             overlay,
-            f"{det['score']:.2f}",
+            f"{det['class']} {det['score']:.2f}",
             (x1, max(y1 - 4, 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
-            (0, 0, 255),
+            bgr,
             1,
         )
 
