@@ -1,0 +1,8 @@
+# Optional ONNX export step during training.
+onnx==1.23.2
+onnxscript==0.7.2
+# Only needed to *verify* the export: tests/test_onnx.py runs the exported graph
+# under ONNX Runtime and checks it agrees with PyTorch. Without it those tests
+# skip, and an export that parses but computes the wrong numbers would go
+# unnoticed.
+onnxruntime==1.31.0

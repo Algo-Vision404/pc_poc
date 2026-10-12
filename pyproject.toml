@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "per-camera-poc"
+version = "0.3.0"
+description = "Multi-task perception PoC: segmentation, monocular depth, and detection from a single frame."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Algo-Vision404" }]
+
+# Minimum bounds here. requirements.txt holds the fully pinned, tested set.
+dependencies = [
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "opencv-python-headless>=4.9",
+    "matplotlib>=3.8",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# Needed only for the optional ONNX export step in training.
+export = ["onnx>=1.16", "onnxscript>=0.1"]
+# httpx is required by starlette.testclient, which tests/test_api.py uses to
+# drive the FastAPI app. Without it the suite fails at collection with
+# "The starlette.testclient module requires httpx" — it previously resolved
+# only by accident, as a transitive dependency of something else installed
+# alongside.
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.4", "httpx>=0.27"]
+
+[project.scripts]
+pc-poc-train = "per_camera.training:main"
+pc-poc-api = "per_camera.api:main"
+pc-poc-infer = "per_camera.inference:main"
+pc-poc-visualize = "per_camera.visualize:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
