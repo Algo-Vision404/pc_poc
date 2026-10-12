@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .detection import box_iou, boxes_xywhn_to_xyxy, decode_detections
+from .detection import box_iou, boxes_xywhn_to_xyxy, class_agnostic_nms, decode_detections
 
 #: Detections are (N, 6): [xc, yc, w, h, score, cls].
 DET_CLS_COL = 5
@@ -176,6 +176,7 @@ def evaluate(
     num_seg_classes: int = 2,
     num_det_classes: int = 1,
     score_thresh: float = 0.2,
+    nms_iou_thresh: float | None = 0.5,
     topk: int = 10,
 ) -> dict[str, float]:
     """Run the model over ``loader`` and return every tracked metric."""
@@ -213,7 +214,15 @@ def evaluate(
             scores = dets[..., 4]
             for b in range(dets.shape[0]):
                 keep = scores[b] >= score_thresh
-                all_dets.append(dets[b][keep].cpu().numpy())
+                frame_dets = dets[b][keep].cpu().numpy()
+                # The API suppresses cross-class duplicates before it responds,
+                # so the metric has to as well. Measuring raw decoder output
+                # scored the same detections twice and reported a precision
+                # nobody would ever observe in practice. Pass
+                # nms_iou_thresh=None to measure the decoder on its own.
+                if nms_iou_thresh is not None:
+                    frame_dets = class_agnostic_nms(frame_dets, iou_thresh=nms_iou_thresh)
+                all_dets.append(frame_dets)
                 m = box_mask[b] > 0.5
                 all_gts.append(boxes_t[b][m].cpu().numpy())
 
