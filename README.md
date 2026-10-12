@@ -490,11 +490,27 @@ The React dashboard provides three input modes and three output panels:
 | Priority | Item |
 |---|---|
 | High | Replace synthetic data with real RGBD camera streams |
-| Medium | Add FPN neck for multi-scale detection on real scenes |
 | Medium | Integrate TensorRT / ONNX Runtime for edge deployment |
-| Medium | Browser tests for the dashboard (the Python side has 84; the UI has none) |
 | Low | Multi-camera synchronization and stereo depth fusion |
 | Low | Continuous training loop with online hard example mining |
+
+### On the FPN neck
+
+"Add an FPN for multi-scale detection" was on this list and has been **removed
+as not justified by the data**. Measured with `metrics.ap_by_size`:
+
+| band | area range | GT boxes | mAP@0.5 |
+|---|---|---|---|
+| small | < 0.005 | 0 | — |
+| medium | 0.005 – 0.015 | 113 | 0.955 |
+| large | > 0.015 | 212 | 0.963 |
+
+Every object in the dataset is 12–21 px on a side at 128×128, so there is no
+small-object regime at all, and performance is flat across the sizes that do
+exist (0.955 vs 0.963). A multi-scale neck would add parameters and complexity
+to solve a problem this data does not have. **Revisit this if real camera
+footage replaces the synthetic generator** — that is when object scale actually
+starts to vary.
 
 Done and no longer on this list: repo-anchored artifact paths, fail-loud
 checkpoint loading, pinned dependencies, seeded reproducible runs,

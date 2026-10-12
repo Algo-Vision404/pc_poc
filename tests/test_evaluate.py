@@ -7,6 +7,7 @@ known heatmap, which makes the metric's behaviour directly assertable.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -170,3 +171,149 @@ def test_a_class_absent_from_ground_truth_is_skipped_not_scored_zero():
 
     assert "ap50_class0" in result
     assert result["map50"] == pytest.approx(result["ap50_class0"])
+
+
+def test_ap_by_size_stratifies_correctly():
+    """Small objects must not be pooled with large ones, or the analysis that
+    decides whether a multi-scale neck is worth building measures nothing."""
+    from per_camera.metrics import ap_by_size
+
+    # One small GT (0.04 x 0.04 = 0.0016) and one large GT (0.2 x 0.2 = 0.04).
+    small = np.array([[0.0, 0.20, 0.20, 0.04, 0.04]])
+    large = np.array([[0.0, 0.70, 0.70, 0.20, 0.20]])
+    gts = [np.vstack([small, large])]
+
+    # Perfect detections for both.
+    dets = [
+        np.array(
+            [
+                [0.20, 0.20, 0.04, 0.04, 0.9, 0.0],
+                [0.70, 0.70, 0.20, 0.20, 0.9, 0.0],
+            ]
+        )
+    ]
+
+    result = ap_by_size(dets, gts, num_classes=NUM_CLASSES)
+
+    assert "small" in result and "large" in result
+    assert result["small"]["n_gt"] == 1.0
+    assert result["large"]["n_gt"] == 1.0
+    assert result["small"]["map50"] == pytest.approx(1.0)
+    assert result["large"]["map50"] == pytest.approx(1.0)
+
+
+def test_ap_by_size_isolates_a_failure_to_its_band():
+    """The whole point: if only small objects fail, only "small" drops."""
+    from per_camera.metrics import ap_by_size
+
+    small = np.array([[0.0, 0.20, 0.20, 0.04, 0.04]])
+    large = np.array([[0.0, 0.70, 0.70, 0.20, 0.20]])
+    gts = [np.vstack([small, large])]
+
+    # Only the large object is detected.
+    dets = [np.array([[0.70, 0.70, 0.20, 0.20, 0.9, 0.0]])]
+
+    result = ap_by_size(dets, gts, num_classes=NUM_CLASSES)
+
+    assert result["large"]["map50"] == pytest.approx(1.0)
+    assert result["small"]["map50"] == pytest.approx(0.0)
+
+
+def test_ap_by_size_bands_cover_the_dataset_range():
+    """If the bands do not span the actual object sizes, every box lands in one
+    bucket and the stratification is decorative."""
+    from per_camera.metrics import SIZE_BANDS
+
+    assert SIZE_BANDS[0][0] == "small"
+    assert SIZE_BANDS[0][1] == 0.0
+    assert SIZE_BANDS[-1][2] == 1.0
+    # Bands must be contiguous and non-overlapping. Pairwise, so strict=False:
+    # the right-hand side is shorter by design.
+    for (_, _, hi), (_, lo, _) in zip(SIZE_BANDS, SIZE_BANDS[1:], strict=False):
+        assert hi == lo
+
+
+def test_ap_by_size_skips_an_empty_band():
+    """A band with no ground truth must be omitted rather than scored 0, or a
+    small validation split would report a false weakness."""
+    from per_camera.metrics import ap_by_size
+
+    large_only = [np.array([[0.0, 0.70, 0.70, 0.20, 0.20]])]
+    dets = [np.array([[0.70, 0.70, 0.20, 0.20, 0.9, 0.0]])]
+
+    result = ap_by_size(dets, large_only, num_classes=NUM_CLASSES)
+
+    assert "small" not in result
+    assert "large" in result
+
+
+def test_ap_by_size_handles_multiple_frames():
+    """Regression: the first version accumulated one array per BOX, but
+    mean_average_precision zips detections and ground truths as parallel
+    per-FRAME lists. Flattening boxes into separate "frames" misaligned the
+    two and mAP collapsed to 0.26 while the unstratified metric read 0.99.
+
+    A single-frame test cannot catch this - with one frame the two
+    interpretations coincide. Hence an explicit multi-frame case where a
+    correct implementation must report a perfect score.
+    """
+    from per_camera.metrics import ap_by_size
+
+    # Two frames, each with one small and one large box of class 0.
+    gts = [
+        np.array(
+            [
+                [0.0, 0.20, 0.20, 0.04, 0.04],  # small, area 0.0016
+                [0.0, 0.70, 0.70, 0.20, 0.20],  # large, area 0.04
+            ]
+        ),
+        np.array(
+            [
+                [0.0, 0.30, 0.30, 0.04, 0.04],
+                [0.0, 0.80, 0.80, 0.20, 0.20],
+            ]
+        ),
+    ]
+    # Perfect detections in both frames.
+    dets = [
+        np.array(
+            [
+                [0.20, 0.20, 0.04, 0.04, 0.9, 0.0],
+                [0.70, 0.70, 0.20, 0.20, 0.8, 0.0],
+            ]
+        ),
+        np.array(
+            [
+                [0.30, 0.30, 0.04, 0.04, 0.9, 0.0],
+                [0.80, 0.80, 0.20, 0.20, 0.8, 0.0],
+            ]
+        ),
+    ]
+
+    result = ap_by_size(dets, gts, num_classes=NUM_CLASSES)
+
+    assert result["small"]["n_gt"] == 2.0
+    assert result["large"]["n_gt"] == 2.0
+    assert result["small"]["map50"] == pytest.approx(1.0), "frame grouping is broken"
+    assert result["large"]["map50"] == pytest.approx(1.0), "frame grouping is broken"
+
+
+def test_ap_by_size_agrees_with_the_unstratified_metric_when_bands_are_uniform():
+    """Cross-check: if every box falls in one band, stratified mAP must equal
+    the plain mAP. This is what caught the misalignment on real data."""
+    from per_camera.metrics import ap_by_size, mean_average_precision
+
+    gts = [
+        np.array([[0.0, 0.70, 0.70, 0.20, 0.20]]),
+        np.array([[0.0, 0.30, 0.30, 0.20, 0.20]]),
+    ]
+    dets = [
+        np.array([[0.70, 0.70, 0.20, 0.20, 0.9, 0.0]]),
+        np.array([[0.30, 0.30, 0.20, 0.20, 0.9, 0.0]]),
+    ]
+
+    stratified = ap_by_size(dets, gts, num_classes=NUM_CLASSES)
+    plain = mean_average_precision(dets, gts, NUM_CLASSES)
+
+    assert list(stratified) == ["large"]
+    assert stratified["large"]["map50"] == pytest.approx(plain["map50"])

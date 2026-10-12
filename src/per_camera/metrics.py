@@ -238,3 +238,88 @@ def evaluate(
         "abs_rel": abs_rel_sum / batches,
         **det_metrics,
     }
+
+
+#: COCO-style area bands, in fraction-of-image area. The dataset spans roughly
+#: 0.002 to 0.03, so "large" is deliberately set below COCO's 0.096 to be
+#: meaningful here rather than vacuously empty.
+SIZE_BANDS: tuple[tuple[str, float, float], ...] = (
+    ("small", 0.0, 0.005),
+    ("medium", 0.005, 0.015),
+    ("large", 0.015, 1.0),
+)
+
+
+def ap_by_size(
+    detections: list[np.ndarray],
+    ground_truths: list[np.ndarray],
+    num_classes: int,
+    iou_threshold: float = 0.5,
+) -> dict[str, dict[str, float]]:
+    """mAP stratified by ground-truth box area.
+
+    Answers the question that decides whether a multi-scale neck is worth
+    building: is detection actually limited by object size? If small objects
+    score as well as large ones, an FPN adds parameters and complexity for a
+    problem this data does not have.
+
+    Detections are assigned to the band of the ground-truth box they matched,
+    so a false positive does not silently inflate whichever band it lands in.
+    """
+    # One entry per FRAME, not per box: mean_average_precision zips detections
+    # and ground truths as parallel per-frame lists, so flattening boxes into
+    # separate "frames" silently misaligns the two and the numbers collapse.
+    bands = {name: {"dets": [], "gts": []} for name, _, _ in SIZE_BANDS}
+
+    for frame_dets, frame_gts in zip(detections, ground_truths, strict=True):
+        # Assign each GT to its band.
+        gt_band: list[str | None] = []
+        for gt in frame_gts:
+            area = float(gt[3] * gt[4])
+            for name, lo, hi in SIZE_BANDS:
+                if lo <= area < hi:
+                    gt_band.append(name)
+                    break
+            else:
+                gt_band.append(None)
+
+        # Greedily match detections to GT, same order as average_precision, so
+        # a band holds the detections that actually hit boxes in that band.
+        taken: set[int] = set()
+        order = np.argsort(-frame_dets[:, 4]) if len(frame_dets) else []
+        det_band: list[str | None] = [None] * len(frame_dets)
+        for rank in order:
+            det = frame_dets[rank]
+            det_xyxy = boxes_xywhn_to_xyxy(det[:4].astype(np.float64))
+            best_iou, best_j = 0.0, -1
+            for j, gt in enumerate(frame_gts):
+                if j in taken:
+                    continue
+                iou = box_iou(det_xyxy, boxes_xywhn_to_xyxy(gt[1:5].astype(np.float64)))
+                if iou > best_iou:
+                    best_iou, best_j = iou, j
+            if best_iou >= iou_threshold:
+                taken.add(best_j)
+                det_band[rank] = gt_band[best_j]
+
+        for name, _, _ in SIZE_BANDS:
+            g = np.array(
+                [frame_gts[j] for j, b in enumerate(gt_band) if b == name], dtype=np.float64
+            ).reshape(-1, 5)
+            d = np.array(
+                [frame_dets[i] for i, b in enumerate(det_band) if b == name], dtype=np.float64
+            ).reshape(-1, 6)
+            bands[name]["gts"].append(g)
+            bands[name]["dets"].append(d)
+
+    out: dict[str, dict[str, float]] = {}
+    for name, _, _ in SIZE_BANDS:
+        bucket = bands[name]
+        n_gt = sum(len(g) for g in bucket["gts"])
+        if n_gt == 0:
+            continue
+        result = mean_average_precision(
+            bucket["dets"], bucket["gts"], num_classes, iou_threshold
+        )
+        out[name] = {"map50": result["map50"], "n_gt": float(n_gt)}
+    return out
