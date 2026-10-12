@@ -148,3 +148,57 @@ def test_early_stopping_triggers_without_a_full_run(tmp_path):
     results = train(manifest, epochs=20, batch_size=4, max_samples=12, patience=1)
 
     assert len(results["history"]) < 20, "patience did not stop the run early"
+
+
+@pytest.mark.parametrize("bad", [0.0, 1.0, -0.1, 1.5])
+def test_val_split_is_validated(bad):
+    """A split of 0 or 1 would leave one side empty; the DataLoader would then
+    divide by zero or silently train on the validation set."""
+    from per_camera.training import train
+
+    with pytest.raises(ValueError, match="val_split"):
+        train(Path("unused.csv"), epochs=1, val_split=bad)
+
+
+def test_val_split_changes_the_actual_split(tmp_path):
+    """The flag has to reach the split, not just parse. A hardcoded 0.8 that
+    ignores the argument is the failure mode being guarded against."""
+    from per_camera.data import generate_synthetic_dataset
+    from per_camera.training import train
+
+    manifest = generate_synthetic_dataset(
+        20, data_dir=tmp_path / "d", manifest_path=tmp_path / "m.csv", seed=11
+    )
+
+    default = train(manifest, epochs=1, batch_size=4, max_samples=20)
+    wide = train(manifest, epochs=1, batch_size=4, max_samples=20, val_split=0.4)
+
+    assert default["config"]["val_split"] == 0.2
+    assert default["config"]["val_size"] == 4  # 20 * 0.2
+    assert wide["config"]["val_split"] == 0.4
+    assert wide["config"]["val_size"] == 8  # 20 * 0.4
+    assert wide["config"]["train_size"] == 12
+    assert wide["config"]["val_size"] != default["config"]["val_size"]
+
+
+def test_cli_rejects_an_out_of_range_val_split():
+    from per_camera.training import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--val-split", "1.5"])
+
+    assert exc.value.code != 0
+
+
+def test_cli_accepts_a_val_split():
+    """End to end: the flag must survive argparse -> train() -> results."""
+    from per_camera import training
+    from per_camera.paths import RESULTS_DIR
+
+    assert training.main(["--samples", "12", "--epochs", "1", "--batch", "4",
+                          "--seed", "4", "--val-split", "0.25"]) == 0
+
+    import json
+
+    config = json.loads((Path(RESULTS_DIR) / "poc_results.json").read_text())["config"]
+    assert config["val_split"] == 0.25

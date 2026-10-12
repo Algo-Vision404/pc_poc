@@ -168,6 +168,7 @@ def train(
     max_samples: int | None = 64,
     seed: int = 0,
     patience: int = 8,
+    val_split: float = 0.2,
     device: torch.device | None = None,
 ) -> dict:
     """Train the network and write a checkpoint plus a results JSON."""
@@ -175,6 +176,8 @@ def train(
     batch_size = int(batch_size)
     if epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
+    if not 0.0 < val_split < 1.0:
+        raise ValueError(f"val_split must be in (0, 1), got {val_split}")
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
@@ -188,7 +191,7 @@ def train(
             f"Need at least 2 samples to form a train/val split, got {len(dataset)}"
         )
 
-    train_size = int(0.8 * len(dataset))
+    train_size = int((1.0 - val_split) * len(dataset))
     val_size = len(dataset) - train_size
     train_ds, val_ds = torch.utils.data.random_split(
         dataset, [train_size, val_size], generator=generator
@@ -343,7 +346,11 @@ def train(
             "epochs": epochs,
             "batch_size": batch_size,
             "dataset_size": len(dataset),
+            "train_size": train_size,
+            "val_size": val_size,
+            "val_split": val_split,
             "seed": seed,
+            "patience": patience,
         },
         "history": history,
         "torch_version": str(torch.__version__),
@@ -373,12 +380,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max_samples", type=int, default=None, help="cap the dataset size")
     parser.add_argument("--seed", type=int, default=0, help="makes the whole run reproducible")
     parser.add_argument("--patience", type=int, default=8, help="early-stopping patience")
+    parser.add_argument(
+        "--val-split",
+        type=float,
+        default=0.2,
+        help="fraction of the dataset held out for validation (default 0.2)",
+    )
     args = parser.parse_args(argv)
 
     if args.samples < 1:
         parser.error("--samples must be >= 1")
     if args.patience < 1:
         parser.error("--patience must be >= 1")
+    if not 0.0 < args.val_split < 1.0:
+        parser.error("--val-split must be between 0 and 1")
 
     _configure_stdout()
     ensure_artifact_dirs()
@@ -393,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         max_samples=args.max_samples,
         seed=args.seed,
         patience=args.patience,
+        val_split=args.val_split,
     )
 
     print(f"Training complete. Best metrics (epoch {results['best_epoch']}):")

@@ -10,9 +10,9 @@ jobs:
     name: Python — lint & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -32,8 +32,10 @@ jobs:
       - name: Lint
         run: ruff check src tests
 
+      # The coverage floor is 95, not the current 97: enough headroom that
+      # ordinary edits do not trip it, but a new untested module cannot land.
       - name: Test
-        run: pytest --tb=short
+        run: pytest --tb=short --cov=per_camera --cov-report=term --cov-fail-under=95
 
   ui:
     name: Dashboard — lint, test & build
@@ -42,9 +44,9 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -59,9 +61,9 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
