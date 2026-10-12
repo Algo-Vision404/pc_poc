@@ -12,6 +12,7 @@ from __future__ import annotations
 import shutil
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -111,3 +112,63 @@ def test_export_cleans_up_its_stdout_reconfiguration(tmp_path, capsys):
 
     assert after is before, "export replaced sys.stdout instead of reconfiguring it"
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_exported_model_computes_the_same_numbers_as_pytorch(tmp_path):
+    """The point of the export.
+
+    A graph that passes `onnx.checker` and has the right output shapes can
+    still compute different numbers — a dropped BatchNorm, a folded constant,
+    an opset difference in how bilinear upsampling rounds. Serving the ONNX
+    while the metrics were measured in PyTorch would mean the published numbers
+    describe a model nobody is running.
+    """
+    ort = pytest.importorskip("onnxruntime", reason="onnxruntime not installed")
+
+    path = tmp_path / "model.onnx"
+    device = torch.device("cpu")
+    model = BigPerCameraNet()
+    model.eval()
+    assert export_onnx(model, device, path) is True
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 3, IMG_SIZE, IMG_SIZE)
+
+    with torch.no_grad():
+        expected = model(x)
+
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    actual = session.run(None, {"input": x.numpy()})
+    names = [o.name for o in session.get_outputs()]
+
+    assert sorted(names) == sorted(expected.keys())
+
+    for name, got in zip(names, actual, strict=True):
+        want = expected[name].numpy()
+        assert got.shape == want.shape, f"{name}: {got.shape} != {want.shape}"
+        # Not exact equality: the ONNX graph is re-optimised and constant-folded,
+        # so tiny float differences are expected. What must not happen is a
+        # systematic divergence, which is what a dropped or reordered op causes.
+        max_abs = float(np.abs(got - want).max())
+        assert max_abs < 1e-4, f"{name}: max abs difference {max_abs}"
+
+
+def test_exported_model_is_deterministic_across_runs(tmp_path):
+    """Catches a graph that depends on uninitialised state, which would make
+    production inference irreproducible while tests still pass."""
+    ort = pytest.importorskip("onnxruntime", reason="onnxruntime not installed")
+
+    path = tmp_path / "model.onnx"
+    model = BigPerCameraNet()
+    model.eval()
+    export_onnx(model, torch.device("cpu"), path)
+
+    torch.manual_seed(1)
+    x = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).numpy()
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+    first = session.run(None, {"input": x})
+    second = session.run(None, {"input": x})
+
+    for a, b in zip(first, second, strict=True):
+        assert np.array_equal(a, b)

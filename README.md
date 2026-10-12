@@ -340,11 +340,22 @@ unprivileged user; weights are **not** baked into the image, so you must run
 ```bash
 pip install -e ".[dev]"
 
-pytest          # 126 tests, 97% statement coverage of src/per_camera
+pytest          # 128 tests, 97% statement coverage of src/per_camera
 ruff check src tests
 
 cd ui && npm test   # 34 more, covering the dashboard
 ```
+
+`httpx` is a hard requirement of the test suite (starlette's `TestClient`
+imports it) and is declared in the `dev` extra. It previously resolved only as a
+transitive dependency of something else, so a clean `pip install -e ".[dev]"`
+failed at collection — which is exactly the sort of breakage a fresh-venv check
+catches and a long-lived one hides.
+
+The ONNX parity test needs `onnxruntime`, declared in
+`requirements-export.txt`. Without it the test skips, and an export that parses
+correctly but computes the wrong numbers would go unnoticed — the published
+metrics would describe a model nobody is actually running.
 
 The suite covers the failure modes this project previously shipped with: cwd-
 dependent artifact paths, manifests carrying another machine's absolute paths,
@@ -360,7 +371,7 @@ crashing on ordinary arguments, and malformed uploads returning 500.
 | `tests/test_checkpoint.py` | Metadata, round-trip, stale-architecture rejection |
 | `tests/test_training.py` | Argument validation, split seeding, val-based selection, early stopping, the CLI end to end |
 | `tests/test_api.py` | `/health` readiness, response contract, 400/413/422 paths, letterbox round-trip |
-| `tests/test_onnx.py` | Export validity and that the exported graph carries the real class count |
+| `tests/test_onnx.py` | Export validity, output names, shapes carrying the real class count — and that the exported graph **computes the same numbers as PyTorch** |
 | `tests/test_inference.py` | Demo-video entry point, and that it leaves the training dataset untouched |
 | `tests/test_visualize.py` | Figure entry point, per-class colormap, clamped sample count |
 
