@@ -38,6 +38,11 @@ RESULTS_DIR: Path = ARTIFACTS / "results"
 
 CHECKPOINT_PATH: Path = MODEL_DIR / "poc_checkpoint.pt"
 ONNX_PATH: Path = MODEL_DIR / "poc_model.onnx"
+
+#: Robust appearance statistics fitted on the training distribution, used to
+#: reject inputs the network was never trained on. Versioned alongside the
+#: checkpoint because it is only meaningful for that checkpoint's data.
+OOD_PATH: Path = MODEL_DIR / "poc_ood.json"
 MANIFEST_PATH: Path = ARTIFACTS / "dataset_manifest.csv"
 RESULTS_JSON: Path = RESULTS_DIR / "poc_results.json"
 

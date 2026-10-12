@@ -45,7 +45,19 @@ def test_predict_returns_all_three_heads(client):
     assert response.status_code == 200
 
     body = response.json()
-    assert set(body) == {"input_b64", "seg_b64", "depth_b64", "detections", "score", "image_size"}
+    assert set(body) == {
+        "input_b64",
+        "seg_b64",
+        "depth_b64",
+        "detections",
+        "score",
+        "image_size",
+        # Out-of-distribution guardrail telemetry.
+        "ood_score",
+        "ood_threshold",
+        "ood_rejected",
+        "ood_suppressed_detections",
+    }
     assert isinstance(body["detections"], list)
     assert 0.0 <= body["score"] <= 1.0
     assert body["image_size"] == {"width": 64, "height": 48}
@@ -275,3 +287,120 @@ def test_letterbox_never_distorts_the_aspect_ratio():
     assert pad_x == 0
     assert pad_y > 0
     assert round(640 * scale) == IMG_SIZE
+
+
+# --- out-of-distribution guardrail -----------------------------------------
+# The test model is trained for one epoch and no OOD statistics are fitted for
+# it, so `per_camera.api.OOD` is None by default. These tests inject a
+# detector to exercise both branches of the gate.
+
+
+class _StubDetector:
+    """Returns a fixed score regardless of input, so the branch is testable
+    without depending on the real statistics."""
+
+    def __init__(self, score: float, threshold: float = 8.0) -> None:
+        self.score_value = score
+        self.threshold = threshold
+        self.n_fit = 42
+
+    def score(self, image):
+        return self.score_value
+
+    def worst_feature(self, image):
+        return "edge_density"
+
+
+def test_predict_reports_guardrail_telemetry(client):
+    body = client.post("/predict", files={"file": ("a.png", _png(), "image/png")}).json()
+    for key in ("ood_score", "ood_threshold", "ood_rejected", "ood_suppressed_detections"):
+        assert key in body
+
+
+def test_training_fits_the_guardrail_alongside_the_checkpoint(trained_artifacts):
+    """Integration: the statistics must ship with the weights, because they
+    only describe the data those weights were trained on."""
+    from per_camera.ood import OODDetector
+    from per_camera.paths import OOD_PATH
+
+    assert OOD_PATH.exists(), "train() did not produce OOD statistics"
+    det = OODDetector.load(OOD_PATH)
+    assert det.n_fit >= 8
+    assert det.threshold > 0
+
+
+def test_unguarded_server_says_so_rather_than_pretending(client, monkeypatch):
+    """When no statistics are fitted the API must report `active: false` -
+    a caller needs to know its detections are unguarded. The training fixture
+    does fit them, so this has to be forced off explicitly."""
+    import per_camera.api as api
+
+    monkeypatch.setattr(api, "OOD", None)
+
+    body = client.get("/health").json()
+    assert body["ood_guardrail"] == {
+        "active": False,
+        "threshold": None,
+        "fitted_on_frames": None,
+    }
+
+    predict = client.post("/predict", files={"file": ("a.png", _png(), "image/png")}).json()
+    assert predict["ood_score"] is None
+    assert predict["ood_threshold"] is None
+    assert predict["ood_rejected"] is False
+
+
+def test_out_of_distribution_input_has_its_detections_suppressed(client, monkeypatch):
+    """The core guarantee. Flagging alone is not enough: a client that ignores
+    a flag still draws the boxes, so they have to be removed."""
+    import per_camera.api as api
+
+    monkeypatch.setattr(api, "OOD", _StubDetector(score=500.0))
+
+    body = client.post("/predict", files={"file": ("a.png", _png(), "image/png")}).json()
+
+    assert body["ood_rejected"] is True
+    assert body["detections"] == []
+    assert body["score"] == 0.0
+    assert body["ood_score"] == 500.0
+    assert body["ood_threshold"] == 8.0
+
+
+def test_suppression_count_is_reported_so_the_decision_is_auditable(client, monkeypatch):
+    """A silent empty result is indistinguishable from 'nothing in frame',
+    which is itself a legitimate answer. The count tells them apart."""
+    import per_camera.api as api
+
+    # Baseline: this input yields at least one detection when accepted.
+    monkeypatch.setattr(api, "OOD", _StubDetector(score=0.0))
+    accepted = client.post("/predict", files={"file": ("a.png", _png(), "image/png")}).json()
+
+    monkeypatch.setattr(api, "OOD", _StubDetector(score=999.0))
+    rejected = client.post("/predict", files={"file": ("a.png", _png(), "image/png")}).json()
+
+    assert rejected["ood_suppressed_detections"] == len(accepted["detections"])
+
+
+def test_in_distribution_input_is_untouched_by_the_guardrail(client, monkeypatch):
+    import per_camera.api as api
+
+    monkeypatch.setattr(api, "OOD", _StubDetector(score=0.0))
+
+    body = client.post("/predict", files={"file": ("a.png", _png(), "image/png")}).json()
+
+    assert body["ood_rejected"] is False
+    assert body["ood_suppressed_detections"] == 0
+    assert body["ood_score"] == 0.0
+
+
+def test_health_reports_an_active_guardrail(client, monkeypatch):
+    import per_camera.api as api
+
+    monkeypatch.setattr(api, "OOD", _StubDetector(score=0.0))
+    body = client.get("/health").json()
+
+    assert body["ood_guardrail"] == {
+        "active": True,
+        "threshold": 8.0,
+        "fitted_on_frames": 42,
+    }

@@ -240,6 +240,57 @@ mIoU   .24 .24 .32  .47  .62  .65  .67  .67  .84  .85  .85  .86 ... .87 .86
 
 ---
 
+## Out-of-Distribution Guardrail
+
+**This model has never seen a real photograph.** It is trained entirely on
+synthetic frames from this repository's own generator, and given one it does
+not merely perform poorly — it performs *confidently* poorly, emitting 11–19
+boxes per real image at scores of 0.2–0.6, none of them real.
+
+That failure mode is the most disqualifying thing a perception system can
+have, because nothing downstream can distinguish an invented box from a real
+one. So the system detects the situation and refuses.
+
+`per_camera/ood.py` fits robust appearance statistics (median and median
+absolute deviation over eight cheap image features) on the raw training
+frames during `train()`, and scores every upload against them before decoding
+detections.
+
+Measured on eight real photographs — four warehouse interiors, four street
+scenes — against the training distribution:
+
+| | OOD score | outcome |
+|---|---|---|
+| Real photographs (n=8) | 66.6 – 244.8 | **8/8 rejected**, 118 invented boxes suppressed |
+| Synthetic frames (n=300) | 0.4 – 11.8 | 299/300 accepted |
+
+The threshold is 8.0, so the margin between the most legitimate training
+frame and the least outlandish real photograph is roughly **5×**. There is no
+overlap.
+
+Detections are **suppressed, not merely flagged** — a client that ignores a
+flag still draws the boxes, which is the exact failure this exists to prevent.
+The response reports `ood_score`, `ood_threshold`, `ood_rejected` and
+`ood_suppressed_detections`, and `/health` reports whether the guardrail is
+active at all.
+
+### Limits, stated plainly
+
+This is a guardrail, not a capability. It does not make the model see better;
+it stops the model lying. Specifically:
+
+- The gap it exploits is partly an artefact of how artificial the training data
+  is — dark, flat, textureless. **Improving the generator with domain
+  randomisation will narrow it**, and the statistics must be re-fitted when
+  that happens (training does this automatically).
+- It will not catch an input engineered to mimic the training statistics.
+- It is fitted per checkpoint. Statistics from one training run say nothing
+  about another.
+
+The honest summary: this makes the system *trustworthy within its known
+limits*, which is a prerequisite for deployment, not a substitute for real
+training data.
+
 ## Quick Start
 
 Requires Python 3.10+.
@@ -432,6 +483,10 @@ so returned geometry maps back onto the original image without distortion.
 | `detections[].class_id` | Same class as an integer, for colour lookups |
 | `score` | Convenience: the top detection's score, or `0.0` if none |
 | `image_size` | Original upload dimensions, so clients can scale overlays |
+| `ood_score` | Robust z-score of the input against the training distribution. `null` when no guardrail is fitted |
+| `ood_threshold` | Rejection threshold; `null` when unguarded |
+| `ood_rejected` | `true` when the input was judged out-of-distribution and detections were suppressed |
+| `ood_suppressed_detections` | How many boxes were withheld, so a rejection is distinguishable from an empty scene |
 
 **Errors**
 

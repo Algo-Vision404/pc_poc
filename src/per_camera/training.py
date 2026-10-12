@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from PIL import Image
 from torch.utils.data import DataLoader
 
 from .classes import CLASS_NAMES, NUM_CLASSES, NUM_SEG_CLASSES
@@ -26,10 +27,12 @@ from .data import PerCameraDataset, build_transform, collate_fn, generate_synthe
 from .detection import SIZE_LOSS_WEIGHT, focal_loss, reg_l1_loss
 from .metrics import evaluate
 from .model import ARCH_VERSION, BigPerCameraNet
+from .ood import OODDetector, extract_features
 from .paths import (
     CHECKPOINT_PATH,
     IMG_SIZE,
     ONNX_PATH,
+    OOD_PATH,
     RESULTS_JSON,
     ensure_artifact_dirs,
 )
@@ -158,6 +161,41 @@ def export_onnx(model: nn.Module, device: torch.device, onnx_path: Path) -> bool
         return False
     print(f"ONNX model saved to {onnx_path}")
     return True
+
+
+def fit_ood_statistics(manifest_path: Path, max_images: int = 300) -> OODDetector | None:
+    """Fit out-of-distribution statistics on the training frames.
+
+    The detector has to describe the *training distribution*, so it reads the
+    raw PNGs off disk rather than the augmented tensors the model sees - the
+    API scores raw uploads before any letterboxing, and the two must be
+    computed the same way or the comparison is meaningless.
+
+    Returns ``None`` if the dataset is too small to fit robustly, in which
+    case the API simply runs without a guardrail rather than refusing to
+    start. A missing guardrail is logged loudly at serve time.
+    """
+    import csv
+
+    with open(manifest_path, newline="") as fh:
+        rows = list(csv.DictReader(fh))[:max_images]
+    if len(rows) < 8:
+        print(f"[warn] only {len(rows)} training frames; skipping OOD statistics")
+        return None
+
+    features = []
+    for row in rows:
+        # Manifest paths are relative to the manifest's own directory.
+        image = Image.open(manifest_path.parent / row["image"]).convert("RGB")
+        features.append(extract_features(np.asarray(image)))
+
+    detector = OODDetector.fit(np.stack(features))
+    detector.save(OOD_PATH)
+    print(
+        f"Fitted OOD statistics on {detector.n_fit} frames "
+        f"(threshold {detector.threshold:.1f}) -> {OOD_PATH}"
+    )
+    return detector
 
 
 def train(
@@ -364,6 +402,19 @@ def train(
     load_checkpoint(best_path, model=model, device=device)
     if export_onnx(model, device, ONNX_PATH):
         results["onnx_path"] = str(ONNX_PATH)
+        with open(RESULTS_JSON, "w") as fh:
+            json.dump(results, fh, indent=2)
+
+    # Fitted last, from the raw frames rather than the augmented tensors: the
+    # API scores raw uploads, so the reference distribution has to describe
+    # raw frames too.
+    detector = fit_ood_statistics(manifest_csv)
+    if detector is not None:
+        results["ood"] = {
+            "path": str(OOD_PATH),
+            "threshold": detector.threshold,
+            "n_fit": detector.n_fit,
+        }
         with open(RESULTS_JSON, "w") as fh:
             json.dump(results, fh, indent=2)
 

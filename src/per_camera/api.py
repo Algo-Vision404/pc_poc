@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import json
 import logging
 import os
 
@@ -26,7 +27,8 @@ from .classes import CLASS_NAMES, SEG_PALETTE, class_name
 from .data import build_transform
 from .detection import class_agnostic_nms, decode_detections
 from .model import ARCH_VERSION, BigPerCameraNet
-from .paths import CHECKPOINT_PATH, IMG_SIZE
+from .ood import OODDetector
+from .paths import CHECKPOINT_PATH, IMG_SIZE, OOD_PATH
 from .training import load_checkpoint
 
 logger = logging.getLogger("per_camera.api")
@@ -51,6 +53,29 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = BigPerCameraNet().to(device)
 CHECKPOINT_META = load_checkpoint(CHECKPOINT_PATH, model=model, device=device)
 model.eval()
+
+# Out-of-distribution guardrail. Loaded alongside the weights because it is
+# only valid for the data those weights were trained on. Absent statistics are
+# a real degradation - the server still answers, but it can no longer tell a
+# caller that its output is invented - so it is logged at WARNING, not debug.
+OOD: OODDetector | None = None
+if OOD_PATH.exists():
+    try:
+        OOD = OODDetector.load(OOD_PATH)
+        logger.info(
+            "OOD guardrail loaded (threshold %.1f, fitted on %d frames)",
+            OOD.threshold,
+            OOD.n_fit,
+        )
+    except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        logger.warning("OOD statistics at %s are unusable: %s", OOD_PATH, exc)
+else:
+    logger.warning(
+        "No OOD statistics at %s - the API will return detections for inputs "
+        "outside the training distribution without flagging them. Run training "
+        "to generate them.",
+        OOD_PATH,
+    )
 
 transform = build_transform()
 
@@ -154,6 +179,14 @@ def health() -> dict:
         "input_size": IMG_SIZE,
         "classes": list(CLASS_NAMES),
         "cors_origins": _origins,
+        # A caller needs to know whether the server can tell it "this input is
+        # outside my training data". `active: false` means every detection it
+        # returns is unguarded, which changes how the output should be used.
+        "ood_guardrail": {
+            "active": OOD is not None,
+            "threshold": OOD.threshold if OOD is not None else None,
+            "fitted_on_frames": OOD.n_fit if OOD is not None else None,
+        },
     }
 
 
@@ -190,6 +223,21 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
         raise HTTPException(status_code=413, detail="Image resolution is too large.")
 
     orig_w, orig_h = img.size
+
+    # Scored on the raw upload, before letterboxing: padding a non-square
+    # frame with black bars would shift the very statistics this measures.
+    # The reference distribution is fitted the same way, in training.
+    ood_score = OOD.score(np.asarray(img)) if OOD is not None else None
+    is_ood = bool(ood_score is not None and ood_score > OOD.threshold)
+    if is_ood:
+        logger.warning(
+            "Rejecting detections for an out-of-distribution input "
+            "(score %.1f > threshold %.1f, driven by %s)",
+            ood_score,
+            OOD.threshold,
+            OOD.worst_feature(np.asarray(img)),
+        )
+
     canvas, scale, pad_x, pad_y = letterbox(img, IMG_SIZE)
     img_t = transform(canvas).unsqueeze(0).to(device)
 
@@ -236,6 +284,15 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
         )
     detections.sort(key=lambda d: -d["score"])
 
+    # Suppress rather than merely flag. On out-of-distribution input every box
+    # here is invented, and a caller that ignores a flag still draws them -
+    # which is exactly the failure this guardrail exists to prevent. The count
+    # is reported so the decision is auditable.
+    suppressed = 0
+    if is_ood:
+        suppressed = len(detections)
+        detections = []
+
     overlay = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
     for det in detections:
         x1 = int(det["x"] * orig_w * scale) + pad_x
@@ -264,6 +321,13 @@ def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008 - FastAPI DI id
         "detections": detections,
         "score": detections[0]["score"] if detections else 0.0,
         "image_size": {"width": orig_w, "height": orig_h},
+        # Guardrail telemetry. `ood_score` is null when no statistics were
+        # fitted, which is itself the signal that the server is running
+        # unguarded.
+        "ood_score": ood_score,
+        "ood_threshold": OOD.threshold if OOD is not None else None,
+        "ood_rejected": is_ood,
+        "ood_suppressed_detections": suppressed,
     }
 
 
